@@ -2,29 +2,36 @@ import * as THREE from 'three';
 import type { World, PlacedVm, PlacedSubnet, PlacedVnet } from './types';
 
 // ---- Topographical map tunables ----
-// The whole bounded area is one continuous fabric of land — VNets are continents,
-// subnets are highlands within them, VMs are peaks on top, peerings raise ridges
-// between continents, and gentle fBm noise adds texture everywhere so the map
-// never reads as flat. A smoothing pass blends it all together.
-const GRID_CELL = 0.45;
-const PADDING = 30;             // generous border so terrain fades, doesn't end abruptly
-const VM_SIGMA = 0.7;           // VM peak — sharp but each peak still resolves
-const VM_BASE = 2.4;
-const VM_PER_HEIGHT = 1.5;      // extra rise per sqrt(tower-height) unit
-const SUBNET_AMP = 2.4;         // highland plateau under each subnet
-const SUBNET_SIGMA_K = 0.55;
-const VNET_AMP = 2.6;           // continent under each vnet
-const VNET_SIGMA_K = 0.85;      // wide — makes vnets blend into one landmass when nearby
-const PEERING_RIDGE_AMP = 1.6;  // mountain ridge connecting peered vnets
-const PEERING_RIDGE_WIDTH = 9;  // ridge half-width in world units
-const NOISE_AMP = 0.9;          // fBm noise amplitude everywhere
-const NOISE_FREQ = 0.06;        // base frequency of the fBm
-const SMOOTH_PASSES = 2;        // box-blur passes after splatting (blends everything)
-const EDGE_FALLOFF_FRAC = 0.7;  // fraction of PADDING used to fade terrain to base
-const BASE_GROUND = 0.0;        // everywhere starts at this elevation (no ocean)
-const CONTOUR_BANDS = 18;       // number of contour lines drawn over the surface
-const COLOR_HIGH_PCT = 0.98;    // percentile elevation that maps to top of palette
-const COLOR_LOW_PCT = 0.04;     // percentile elevation that maps to bottom of palette
+// The whole map is one rolling landmass. The VNet/subnet groupings ARE the
+// mountains; individual VMs only add modest summit character — they don't poke
+// up as spikes. Heavy smoothing knits everything (noise, peaks, plateaus) into
+// a single flowing fabric of terrain.
+const GRID_CELL = 0.5;
+const PADDING = 36;             // generous border so terrain fades into open country
+// VM bump: wide and gentle so peaks read as rounded summit knolls, not pencils.
+const VM_SIGMA = 1.4;
+const VM_BASE = 0.55;           // small base bump per VM
+const VM_PER_HEIGHT = 0.55;     // modest extra rise per sqrt(tower-height) unit
+// Subnets are sub-ranges that sit on the larger VNet mountain.
+const SUBNET_AMP = 1.7;
+const SUBNET_SIGMA_K = 0.7;
+// VNets are the dominant mountains — wide and tall, so subnets read as
+// shoulders on them rather than separate hills.
+const VNET_AMP = 5.0;
+const VNET_SIGMA_K = 1.15;      // very wide so multiple vnets blend at their edges
+// Peering: a substantial mountain ridge linking the two VNet summits.
+const PEERING_RIDGE_AMP = 3.6;
+const PEERING_RIDGE_WIDTH = 16;
+// Background fBm noise gives the land texture everywhere so it never reads
+// like a smooth dome with sharp summit features stuck on top.
+const NOISE_AMP = 1.6;
+const NOISE_FREQ = 0.05;
+const SMOOTH_PASSES = 4;        // blend hard splats into rolling terrain
+const EDGE_FALLOFF_FRAC = 0.85; // smoother fade at the map border
+const BASE_GROUND = 0.0;
+const CONTOUR_BANDS = 18;
+const COLOR_HIGH_PCT = 0.985;
+const COLOR_LOW_PCT = 0.04;
 const SUBNET_EDGE_CAP = 200;
 
 // Unified terrestrial palette — low valleys to snowy peaks, no ocean break.
@@ -152,13 +159,9 @@ export function buildScene(world: World): BuiltScene {
     scene.add(new THREE.LineSegments(cg, cm));
   }
 
-  // ---- VNet / subnet boundary outlines, projected to terrain ----
-  pushRectOutline(scene, world.vnets.map(v => ({
-    cx: v.center[0], cz: v.center[1], size: v.size + 4, color: 0xffffff, opacity: 0.55, width: 1.2,
-  })), elev, minX, minZ, width, depth, cols, rows, disposables);
-  pushRectOutline(scene, world.subnets.map(s => ({
-    cx: s.center[0], cz: s.center[1], size: s.size, color: 0xffffff, opacity: 0.32, width: 0.8,
-  })), elev, minX, minZ, width, depth, cols, rows, disposables);
+  // VNet / subnet outlines suppressed in topo mode: the terrain itself
+  // (continents, ridges, summit highlands) communicates the grouping. Hard
+  // rectangles would make logical groups read as separate bordered islands.
 
   // ---- Labels: VNet name floats above the highest peak in that VNet ----
   for (const vn of world.vnets) {
@@ -177,7 +180,7 @@ export function buildScene(world: World): BuiltScene {
 
   const vmTowers: THREE.InstancedMesh[] = [];
   const vmInstanceMap = new Map<THREE.InstancedMesh, PlacedVm[]>();
-  const sphereGeom = new THREE.SphereGeometry(0.55, 10, 8);
+  const sphereGeom = new THREE.SphereGeometry(0.32, 10, 8);
   disposables.push(sphereGeom);
 
   for (const os of Object.keys(buckets) as Array<keyof typeof buckets>) {
@@ -190,7 +193,7 @@ export function buildScene(world: World): BuiltScene {
     const dummy = new THREE.Object3D();
     list.forEach((vm, i) => {
       const y = sampleHeight(elev, cols, rows, minX, minZ, width, depth, vm.pos[0], vm.pos[2]);
-      dummy.position.set(vm.pos[0], y + 0.6, vm.pos[2]);
+      dummy.position.set(vm.pos[0], y + 0.35, vm.pos[2]);
       dummy.updateMatrix();
       inst.setMatrixAt(i, dummy.matrix);
     });
