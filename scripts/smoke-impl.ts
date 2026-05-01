@@ -7,17 +7,17 @@ export async function run(path: string) {
   const arr = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
   const log = (m: string) => console.log('  ' + m);
   console.log(`\n=== Parsing ${path} ===`);
-  const graph = parseAri(arr as ArrayBuffer, log);
+  const { graph } = parseAri(arr as ArrayBuffer, log);
   console.log(`\n=== Building world ===`);
   const world = buildWorld(graph);
 
   // ---- Assertions ----
   const fail = (msg: string) => { console.error('FAIL:', msg); process.exitCode = 1; };
 
-  if (graph.vms.length !== 9) fail(`expected 9 VMs, got ${graph.vms.length}`);
-  if (graph.vnets.length !== 2) fail(`expected 2 vnets, got ${graph.vnets.length}`);
-  if (graph.subnets.length !== 4) fail(`expected 4 subnets, got ${graph.subnets.length}`);
-  if (graph.peerings.length !== 1) fail(`expected 1 peering, got ${graph.peerings.length}`);
+  if (graph.vms.length !== 9)      fail(`expected 9 VMs, got ${graph.vms.length}`);
+  if (graph.vnets.length !== 3)    fail(`expected 3 vnets, got ${graph.vnets.length}`);
+  if (graph.subnets.length !== 5)  fail(`expected 5 subnets, got ${graph.subnets.length}`);
+  if (graph.peerings.length !== 2) fail(`expected 2 peerings, got ${graph.peerings.length}`);
 
   // Every VM must be linked to a subnet (the fixture has full NIC coverage).
   const orphan = graph.vms.filter(v => !v.subnetId);

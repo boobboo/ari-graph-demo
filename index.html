@@ -3,7 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>ARI Topology — Minecraft Mode</title>
+    <title>ARI Topology — Azure Estate Viewer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
     <style>
       :root {
         color-scheme: dark;
@@ -105,10 +107,75 @@
         display: none;
       }
       #reset:hover { background: #2a3d52; }
+
+      /* Mode toggle bar */
+      #mode-bar {
+        position: fixed; top: 12px; right: 12px; z-index: 6;
+        display: none; gap: 4px;
+      }
+      .mode-btn {
+        background: #20303f; color: #9fb1c7; border: 1px solid #2a3d52;
+        padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
+        transition: background .12s, color .12s;
+      }
+      .mode-btn:hover { background: #2a3d52; }
+      .mode-btn.active { background: var(--accent); color: #03121f; border-color: var(--accent); font-weight: 600; }
+
+      /* OS Map container */
+      #os-map-root {
+        position: fixed; inset: 0;
+        display: none;
+        overflow: auto;
+        background: #2a2a2a;
+        align-items: center;
+        justify-content: center;
+        padding-top: 48px; /* room for control bar */
+      }
+      #os-map-root svg {
+        display: block;
+        box-shadow: 0 8px 40px rgba(0,0,0,0.55);
+      }
+
+      /* OS Map control bar — shown when OS Map view is active */
+      #os-controls {
+        position: fixed; top: 0; left: 0; right: 0;
+        height: 44px; z-index: 7;
+        display: none; align-items: center; gap: 8px;
+        padding: 0 12px;
+        background: rgba(10,16,22,0.92); backdrop-filter: blur(6px);
+        border-bottom: 1px solid #20303f;
+      }
+      #os-controls label { color: #9fb1c7; font-size: 12px; }
+      #os-controls select {
+        background: #20303f; color: #e8eef5; border: 1px solid #2a3d52;
+        padding: 3px 6px; border-radius: 5px; font-size: 12px; cursor: pointer;
+      }
+      #os-controls .sep { flex: 1; }
+      .tier-btn {
+        background: #20303f; color: #9fb1c7; border: 1px solid #2a3d52;
+        padding: 4px 10px; border-radius: 5px; font-size: 11px; cursor: pointer;
+        transition: background .12s, color .12s;
+      }
+      .tier-btn:hover { background: #2a3d52; }
+      .tier-btn.active { background: #4a7a9b; color: #fff; border-color: #4a7a9b; font-weight: 600; }
+      #btn-export, #btn-png, #btn-a3 {
+        background: #20303f; color: #9fb1c7; border: 1px solid #2a3d52;
+        padding: 4px 10px; border-radius: 5px; font-size: 11px; cursor: pointer;
+        transition: background .12s, color .12s;
+      }
+      #btn-export:hover, #btn-png:hover, #btn-a3:hover { background: #2a3d52; color: #e8eef5; }
+      #btn-a3.active { background: #4a7a9b; color: #fff; border-color: #4a7a9b; font-weight: 600; }
     </style>
   </head>
   <body>
     <div id="canvas-root"></div>
+    <div id="os-map-root"></div>
+
+    <!-- Mode toggle (shown after file load) -->
+    <div id="mode-bar">
+      <button class="mode-btn active" id="btn-terrain" type="button">🏔 Terrain</button>
+      <button class="mode-btn" id="btn-osmap" type="button">🗺 OS Map</button>
+    </div>
 
     <div id="crosshair"></div>
     <div id="lockprompt">Click to look around · WASD to move · Space/Shift up/down · Esc to release</div>
@@ -123,6 +190,27 @@
       <div class="row"><span class="sw" style="background:#e8eef5"></span> Subnet edge</div>
     </div>
     <button id="reset" type="button">Load another file</button>
+
+    <!-- OS Map control bar (shown when OS Map view is active) -->
+    <div id="os-controls">
+      <label for="scalar-mode">Elevation:</label>
+      <select id="scalar-mode">
+        <option value="cost" selected>Monthly cost (£)</option>
+        <option value="criticality">Criticality score</option>
+        <option value="age">Age (months)</option>
+        <option value="blast">Blast radius</option>
+        <option value="change">Change freq (30d)</option>
+      </select>
+      <span style="width:16px"></span>
+      <label>Scale tier:</label>
+      <button class="tier-btn" id="btn-road" type="button">Road 1:250k</button>
+      <button class="tier-btn active" id="btn-land" type="button">Landranger 1:50k</button>
+      <button class="tier-btn" id="btn-explorer" type="button">Explorer 1:25k</button>
+      <span class="sep"></span>
+      <button id="btn-a3" type="button">A3</button>
+      <button id="btn-export" type="button">⬇ SVG</button>
+      <button id="btn-png" type="button">⬇ PNG</button>
+    </div>
 
     <div id="landing">
       <div id="drop">

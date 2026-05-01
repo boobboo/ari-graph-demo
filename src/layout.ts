@@ -1,4 +1,5 @@
 import type { Graph, World, PlacedVm, PlacedSubnet, PlacedVnet, Subnet, Vm } from './types';
+import type { EstateModel } from './estate-model';
 
 // Topographic mode: VMs sit along a horizontal row inside each subnet so the
 // row reads as a connected mountain ridge with each VM as a summit. Subnets
@@ -59,7 +60,7 @@ function subnetExtent(vmCount: number): SubnetExtent {
   return { width, depth, rows, perRow };
 }
 
-export function buildWorld(graph: Graph): World {
+export function buildWorld(graph: Graph, estate?: EstateModel): World {
   // Synthetic "unattached" subnet for VMs without a NIC link.
   const orphanVms = graph.vms.filter(v => !v.subnetId);
   let allSubnets = [...graph.subnets];
@@ -94,10 +95,21 @@ export function buildWorld(graph: Graph): World {
   const maxC = Math.max(...vCPUs, minC + 1);
   const minR = Math.min(...rams, 1);
   const maxR = Math.max(...rams, minR + 1);
+
+  // §10 shared-catalogue: blend criticalityScore (30%) from EstateModel into VM height
+  const critByVmId = new Map<string, number>();
+  if (estate) {
+    for (const r of estate.resources) {
+      if (r.type === 'vm') critByVmId.set(r.id, r.criticalityScore);
+    }
+  }
+
   const heightFor = (v: Vm) => {
     const nc = (v.vCPU - minC) / Math.max(1e-6, maxC - minC);
     const nr = (v.ramGB - minR) / Math.max(1e-6, maxR - minR);
-    const score = (clamp01(nc) + clamp01(nr)) / 2;
+    const hwScore = (clamp01(nc) + clamp01(nr)) / 2;
+    const crit = clamp01((critByVmId.get(v.id) ?? 0) / 10);
+    const score = hwScore * 0.7 + crit * 0.3;
     return Math.max(MIN_TOWER, Math.min(MAX_TOWER, Math.round(MIN_TOWER + score * (MAX_TOWER - MIN_TOWER))));
   };
 
