@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__playwright-headless__browser_take_screenshot",
+      "mcp__playwright-headless__browser_console_messages",
+      "mcp__playwright-headless__browser_evaluate",
+      "mcp__playwright-headless__browser_close",
+      "Bash(git add *)",
+      "Bash(git commit -m 'Semantic Azure->city mapping: districts, towers, NSGs, public IPs, storage *)",
+      "Bash(node -e ' *)"
+    ]
+  }
+}

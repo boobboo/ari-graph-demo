@@ -1,0 +1,31 @@
+{
+  "hash": "4cd2a44a",
+  "configHash": "9e08c9a3",
+  "lockfileHash": "a10faa6c",
+  "browserHash": "acac18ec",
+  "optimized": {
+    "three": {
+      "src": "../../node_modules/three/build/three.module.js",
+      "file": "three.js",
+      "fileHash": "25dcf3c8",
+      "needsInterop": false
+    },
+    "three/examples/jsm/controls/PointerLockControls.js": {
+      "src": "../../node_modules/three/examples/jsm/controls/PointerLockControls.js",
+      "file": "three_examples_jsm_controls_PointerLockControls__js.js",
+      "fileHash": "b9fdcb6f",
+      "needsInterop": false
+    },
+    "xlsx": {
+      "src": "../../node_modules/xlsx/xlsx.mjs",
+      "file": "xlsx.js",
+      "fileHash": "b29daa41",
+      "needsInterop": false
+    }
+  },
+  "chunks": {
+    "chunk-UGD7UY7I": {
+      "file": "chunk-UGD7UY7I.js"
+    }
+  }
+}
