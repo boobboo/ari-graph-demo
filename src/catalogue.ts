@@ -300,3 +300,44 @@ export const ZONE_TINT: Record<RciBias['primary'], number> = {
   I: 0xd6c79a,   // ochre / sandy
   Mixed: 0xc8c8b8,
 };
+
+// ---- Landmark detection (PRD §5.6) -------------------------------------
+// Signature workloads get bespoke landmark sprites that act as navigation
+// anchors across customer reviews. Detection is by name pattern — works
+// across customer estates because workload-naming conventions are durable
+// (SAP/MES/EDW/GIS/etc.).
+
+export type LandmarkKind =
+  | 'sap'           // SAP S/4HANA, ECC
+  | 'mes'           // Manufacturing Execution Systems
+  | 'edw'           // Enterprise Data Warehouse
+  | 'gis'           // Geographic Information Systems
+  | 'analytics'     // Analytics / BI clusters
+  | 'jumphost'      // Jump / bastion VMs
+  | 'mainframe';    // Mainframe-era heritage
+
+export interface LandmarkHit {
+  kind: LandmarkKind;
+  /** Symbol shown above the landmark sprite. */
+  symbol: string;
+  /** Display title for the news ticker. */
+  title: string;
+}
+
+const LANDMARK_PATTERNS: Array<{ rx: RegExp; kind: LandmarkKind; symbol: string; title: string }> = [
+  { rx: /\b(sap|s4hana|ecc|fiori|hana)\b/i,           kind: 'sap',       symbol: 'S',  title: 'SAP landmark' },
+  { rx: /\b(mes|opcenter|prodserver)\b/i,             kind: 'mes',       symbol: 'M',  title: 'MES landmark' },
+  { rx: /\b(edw|datawarehouse|synapse|dwh)\b/i,       kind: 'edw',       symbol: 'D',  title: 'Data warehouse landmark' },
+  { rx: /\b(gis|esri|arcgis|geoserver)\b/i,           kind: 'gis',       symbol: 'G',  title: 'GIS landmark' },
+  { rx: /\b(analytics|bi|powerbi|tableau)\b/i,        kind: 'analytics', symbol: 'A',  title: 'Analytics landmark' },
+  { rx: /\b(jump|bastion|jb|jumphost)\b/i,            kind: 'jumphost',  symbol: 'J',  title: 'Jump host landmark' },
+  { rx: /\b(mainframe|zos|legacy|mf)\b/i,             kind: 'mainframe', symbol: 'L',  title: 'Mainframe landmark' },
+];
+
+/** Detect a landmark from a resource name. Returns null if none match. */
+export function detectLandmark(resourceName: string): LandmarkHit | null {
+  for (const p of LANDMARK_PATTERNS) {
+    if (p.rx.test(resourceName)) return { kind: p.kind, symbol: p.symbol, title: p.title };
+  }
+  return null;
+}

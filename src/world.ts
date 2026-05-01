@@ -14,7 +14,7 @@ import type {
   World, PlacedVm, PlacedNsg, PlacedPublicIp, PlacedStorage, PlacedOther,
   PlacedRegion, PlacedSubscription, PlacedResourceGroup,
 } from './types';
-import { ZONE_TINT } from './catalogue';
+import { ZONE_TINT, detectLandmark } from './catalogue';
 
 // ---- Vertical bands ----------------------------------------------------
 const REGION_FLOOR_H = 0.12;
@@ -398,6 +398,20 @@ export function buildScene(world: World): BuiltScene {
     addBridgeBox(scene, a.center, b.center, REGION_FLOOR_H + 0.15, 1.6, 0.4, 0x3a3835, disposables);
   }
 
+  // ---- Landmarks (PRD §5.6) ------------------------------------------
+  // Signature workloads get a tall obelisk plus a letter sprite floating
+  // above the building so they act as navigation anchors at any zoom.
+  for (const v of world.vms) {
+    const lm = detectLandmark(v.name);
+    if (!lm) continue;
+    addLandmark(scene, [v.pos[0], v.pos[2]], buildingBaseY + v.storeys * STOREY_H, lm.symbol, disposables);
+  }
+  for (const o of world.others) {
+    const lm = detectLandmark(o.name);
+    if (!lm) continue;
+    addLandmark(scene, o.pos, buildingBaseY + o.storeys * STOREY_H, lm.symbol, disposables);
+  }
+
   // ---- Coverage radii (PRD §5.6, the "killer mapping") ---------------
   // Each civic emitter (Key Vault, Recovery Vault, Defender, Log Analytics)
   // radiates a coloured disc on the ground. Buildings outside the union of
@@ -576,6 +590,43 @@ function buildOverlay(
     disposables.push(geom, mat);
   }
   return group;
+}
+
+function addLandmark(
+  scene: THREE.Scene,
+  pos: [number, number],
+  topY: number,
+  symbol: string,
+  disposables: Array<{ dispose(): void }>,
+) {
+  // Tall obelisk + a labelled sprite cap so the landmark is recognisable from
+  // any zoom level (PRD §5.6: signature workload anchors).
+  const obeliskGeom = new THREE.CylinderGeometry(0.18, 0.18, 5, 6);
+  const obeliskMat = new THREE.MeshLambertMaterial({ color: 0xc7a04a });
+  const obelisk = new THREE.Mesh(obeliskGeom, obeliskMat);
+  obelisk.position.set(pos[0], topY + 2.5, pos[1]);
+  scene.add(obelisk);
+  disposables.push(obeliskGeom, obeliskMat);
+
+  // Letter cap as a canvas sprite.
+  const canvas = document.createElement('canvas');
+  canvas.width = 128; canvas.height = 128;
+  const ctx = canvas.getContext('2d')!;
+  ctx.fillStyle = 'rgba(199,160,74,0.95)';
+  ctx.beginPath();
+  ctx.arc(64, 64, 56, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#1a1a1a';
+  ctx.font = 'bold 80px ui-sans-serif, system-ui, sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(symbol, 64, 70);
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(2.4, 2.4, 1);
+  sprite.position.set(pos[0], topY + 6, pos[1]);
+  scene.add(sprite);
+  disposables.push(tex, mat);
 }
 
 function findRgIdByName(world: World, rgName: string): string {
