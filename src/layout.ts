@@ -1,11 +1,15 @@
 import type { Graph, World, PlacedVm, PlacedSubnet, PlacedVnet, Subnet, Vm } from './types';
 
-const VM_SPACING = 3;          // grid pitch between VM towers within a subnet
-const VM_PAD = 2;              // padding around the VM grid on a subnet pad
-const SUBNET_GAP = 6;          // gap between subnet pads inside a VNet
-const VNET_GAP = 24;           // gap between VNet plots
+// Topographic mode: VMs sit along a horizontal row inside each subnet so the
+// row reads as a connected mountain ridge with each VM as a summit. Subnets
+// stack vertically within their VNet — parallel ridges making one massif.
+const VM_SPACING = 8;          // pitch between VM peaks along the subnet ridge
+const VM_PAD = 4;              // padding at the ends of each subnet ridge
+const ROW_GAP = 8;             // vertical gap between subnet ridges inside a VNet
+const VNET_GAP = 28;           // gap between VNet ranges
 const MAX_TOWER = 32;          // tallest VM tower, in blocks
 const MIN_TOWER = 1;
+const MAX_VMS_PER_ROW = 8;     // wrap to a second/third ridge if a subnet has more
 
 // FNV-1a-ish hash → 0..1
 function hash01(s: string): number {
@@ -44,9 +48,15 @@ function gridSide(n: number): number {
   return Math.max(1, Math.ceil(Math.sqrt(Math.max(1, n))));
 }
 
-function subnetSize(vmCount: number): number {
-  const side = gridSide(vmCount);
-  return side * VM_SPACING + VM_PAD * 2;
+interface SubnetExtent { width: number; depth: number; rows: number; perRow: number; }
+
+function subnetExtent(vmCount: number): SubnetExtent {
+  const n = Math.max(1, vmCount);
+  const perRow = Math.min(MAX_VMS_PER_ROW, n);
+  const rows = Math.ceil(n / perRow);
+  const width = perRow * VM_SPACING + VM_PAD * 2;
+  const depth = rows * VM_SPACING + VM_PAD * 2;
+  return { width, depth, rows, perRow };
 }
 
 export function buildWorld(graph: Graph): World {
@@ -91,24 +101,29 @@ export function buildWorld(graph: Graph): World {
     return Math.max(MIN_TOWER, Math.min(MAX_TOWER, Math.round(MIN_TOWER + score * (MAX_TOWER - MIN_TOWER))));
   };
 
-  // ---- VNet outer grid ----
-  const vnetSizes = new Map<string, number>();
+  // ---- Subnet extents per VNet (subnets stack vertically inside the VNet) ----
+  interface VnetGeom { width: number; depth: number; subExt: SubnetExtent[]; }
+  const vnetGeom = new Map<string, VnetGeom>();
   for (const vn of vnets) {
     const subs = subnetsByVnet.get(vn.id) ?? [];
-    const subSizes = subs.map(s => subnetSize((vmsBySubnet.get(s.id) ?? []).length));
-    const subnetSide = gridSide(subs.length);
-    const cellSize = Math.max(VM_SPACING * 2, ...subSizes);
-    const side = subnetSide * cellSize + (subnetSide - 1) * SUBNET_GAP + VM_SPACING * 2;
-    vnetSizes.set(vn.id, side);
+    const subExt = subs.map(s => subnetExtent((vmsBySubnet.get(s.id) ?? []).length));
+    const width = Math.max(VM_SPACING * 2, ...subExt.map(e => e.width));
+    const depth = subExt.reduce((sum, e) => sum + e.depth, 0)
+                + Math.max(0, subs.length - 1) * ROW_GAP
+                + VM_PAD * 2;
+    vnetGeom.set(vn.id, { width, depth, subExt });
   }
 
+  // ---- VNet outer grid: place VNets in a square arrangement ----
   const vnetSide = gridSide(vnets.length);
-  // Use the largest VNet size as the cell pitch so layouts stay rectilinear.
-  const maxVnetSize = Math.max(...vnets.map(v => vnetSizes.get(v.id) ?? VM_SPACING * 4), VM_SPACING * 4);
-  const vnetCellPitch = maxVnetSize + VNET_GAP;
-  const totalSpan = vnetSide * maxVnetSize + (vnetSide - 1) * VNET_GAP;
-  const originX = -totalSpan / 2 + maxVnetSize / 2;
-  const originZ = -totalSpan / 2 + maxVnetSize / 2;
+  const maxVnetW = Math.max(...vnets.map(v => vnetGeom.get(v.id)?.width ?? VM_SPACING * 4));
+  const maxVnetD = Math.max(...vnets.map(v => vnetGeom.get(v.id)?.depth ?? VM_SPACING * 4));
+  const cellPitchX = maxVnetW + VNET_GAP;
+  const cellPitchZ = maxVnetD + VNET_GAP;
+  const totalSpanX = vnetSide * maxVnetW + (vnetSide - 1) * VNET_GAP;
+  const totalSpanZ = vnetSide * maxVnetD + (vnetSide - 1) * VNET_GAP;
+  const originX = -totalSpanX / 2 + maxVnetW / 2;
+  const originZ = -totalSpanZ / 2 + maxVnetD / 2;
 
   const placedVnets: PlacedVnet[] = [];
   const placedSubnets: PlacedSubnet[] = [];
@@ -117,40 +132,47 @@ export function buildWorld(graph: Graph): World {
   vnets.forEach((vn, idx) => {
     const gx = idx % vnetSide;
     const gz = Math.floor(idx / vnetSide);
-    const cx = originX + gx * vnetCellPitch;
-    const cz = originZ + gz * vnetCellPitch;
-    const size = vnetSizes.get(vn.id) ?? maxVnetSize;
+    const cx = originX + gx * cellPitchX;
+    const cz = originZ + gz * cellPitchZ;
+    const geom = vnetGeom.get(vn.id) ?? { width: VM_SPACING * 4, depth: VM_SPACING * 4, subExt: [] };
+    const size = Math.max(geom.width, geom.depth);
     const color = vn.id === '__unattached__' ? 0x444a52 : vnetColor(vn.name);
-    placedVnets.push({ ...vn, center: [cx, cz], size, color });
+    placedVnets.push({
+      ...vn,
+      center: [cx, cz],
+      size, width: geom.width, depth: geom.depth,
+      color,
+    });
 
     const subs = subnetsByVnet.get(vn.id) ?? [];
-    const subSide = gridSide(subs.length);
-    const subSizes = subs.map(s => subnetSize((vmsBySubnet.get(s.id) ?? []).length));
-    const cellSize = Math.max(VM_SPACING * 2, ...subSizes);
-    const innerPitch = cellSize + SUBNET_GAP;
-    const innerSpan = subSide * cellSize + (subSide - 1) * SUBNET_GAP;
-    const innerOriginX = cx - innerSpan / 2 + cellSize / 2;
-    const innerOriginZ = cz - innerSpan / 2 + cellSize / 2;
-
+    // Stack subnets vertically within VNet, top to bottom.
+    const stackTopZ = cz - geom.depth / 2 + VM_PAD;
+    let cursorZ = stackTopZ;
     subs.forEach((s, si) => {
-      const sx = si % subSide;
-      const sz = Math.floor(si / subSide);
-      const subCx = innerOriginX + sx * innerPitch;
-      const subCz = innerOriginZ + sz * innerPitch;
+      const ext = geom.subExt[si];
+      const subCz = cursorZ + ext.depth / 2;
+      const subCx = cx;
+      cursorZ += ext.depth + ROW_GAP;
       const localVms = vmsBySubnet.get(s.id) ?? [];
-      const ssize = subnetSize(localVms.length);
-      placedSubnets.push({ ...s, center: [subCx, subCz], size: ssize, vnetCenter: [cx, cz] });
+      placedSubnets.push({
+        ...s,
+        center: [subCx, subCz],
+        size: Math.max(ext.width, ext.depth),
+        width: ext.width,
+        depth: ext.depth,
+        vnetCenter: [cx, cz],
+      });
 
-      // VMs on the subnet pad
-      const vside = gridSide(localVms.length);
-      const vmSpan = vside * VM_SPACING;
-      const vmOriginX = subCx - vmSpan / 2 + VM_SPACING / 2;
-      const vmOriginZ = subCz - vmSpan / 2 + VM_SPACING / 2;
+      // VMs along the subnet ridge: row-major within ext.perRow x ext.rows.
+      const totalRowWidth = ext.perRow * VM_SPACING;
+      const totalColDepth = ext.rows * VM_SPACING;
+      const vmOriginX = subCx - totalRowWidth / 2 + VM_SPACING / 2;
+      const vmOriginZ = subCz - totalColDepth / 2 + VM_SPACING / 2;
       localVms.forEach((vm, vi) => {
-        const vx = vi % vside;
-        const vz = Math.floor(vi / vside);
-        const x = vmOriginX + vx * VM_SPACING;
-        const z = vmOriginZ + vz * VM_SPACING;
+        const col = vi % ext.perRow;
+        const row = Math.floor(vi / ext.perRow);
+        const x = vmOriginX + col * VM_SPACING;
+        const z = vmOriginZ + row * VM_SPACING;
         const h = heightFor(vm);
         placedVms.push({ ...vm, pos: [x, 0, z], height: h });
       });

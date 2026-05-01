@@ -52,13 +52,17 @@ export interface PlacedVm extends Vm {
 
 export interface PlacedSubnet extends Subnet {
   center: [number, number];
-  size: number;
+  size: number;          // max(width, depth) — kept for label scaling, sprite sizing
+  width: number;         // X extent of the subnet ridge
+  depth: number;         // Z extent of the subnet ridge
   vnetCenter: [number, number];
 }
 
 export interface PlacedVnet extends Vnet {
   center: [number, number];
-  size: number;
+  size: number;          // max(width, depth)
+  width: number;
+  depth: number;
   color: number;
 }
 

@@ -2,32 +2,31 @@ import * as THREE from 'three';
 import type { World, PlacedVm, PlacedSubnet, PlacedVnet } from './types';
 
 // ---- Topographical map tunables ----
-// The whole map is one rolling landmass. The VNet/subnet groupings ARE the
-// mountains; individual VMs only add modest summit character — they don't poke
-// up as spikes. Heavy smoothing knits everything (noise, peaks, plateaus) into
-// a single flowing fabric of terrain.
-const GRID_CELL = 0.5;
-const PADDING = 36;             // generous border so terrain fades into open country
-// VM bump: wide and gentle so peaks read as rounded summit knolls, not pencils.
-const VM_SIGMA = 1.4;
-const VM_BASE = 0.55;           // small base bump per VM
-const VM_PER_HEIGHT = 0.55;     // modest extra rise per sqrt(tower-height) unit
-// Subnets are sub-ranges that sit on the larger VNet mountain.
-const SUBNET_AMP = 1.7;
-const SUBNET_SIGMA_K = 0.7;
-// VNets are the dominant mountains — wide and tall, so subnets read as
-// shoulders on them rather than separate hills.
-const VNET_AMP = 5.0;
-const VNET_SIGMA_K = 1.15;      // very wide so multiple vnets blend at their edges
-// Peering: a substantial mountain ridge linking the two VNet summits.
-const PEERING_RIDGE_AMP = 3.6;
-const PEERING_RIDGE_WIDTH = 16;
-// Background fBm noise gives the land texture everywhere so it never reads
-// like a smooth dome with sharp summit features stuck on top.
-const NOISE_AMP = 1.6;
+// Layout puts VMs along a row inside each subnet at VM_SPACING=8 apart. With
+// VM_SIGMA tuned so 3*sigma is just over half the spacing, adjacent VMs in a
+// subnet overlap into a connected ridge line with each VM as a distinct summit
+// — exactly like reading a real mountain range. Subnets become parallel ridges
+// running across the larger VNet mountain.
+const GRID_CELL = 0.55;
+const PADDING = 36;
+// VM bump: wide enough that adjacent VMs (8 units apart) connect via a saddle
+// at ~30% of peak height — peaks stay distinct, the ridge is continuous.
+const VM_SIGMA = 2.6;
+const VM_BASE = 2.4;            // base rise above the VNet mountain per VM
+const VM_PER_HEIGHT = 1.6;      // extra rise per sqrt(tower-height) unit
+// Subnet plateau dropped to a tiny lift — the row of VM peaks IS the ridge.
+const SUBNET_AMP = 0.6;
+const SUBNET_SIGMA_K = 0.55;
+// VNet is the broad mountain mass that all subnet ridges sit on.
+const VNET_AMP = 3.6;
+const VNET_SIGMA_K = 0.8;
+// Peering: mountain ridge linking the two VNet summits across the saddle.
+const PEERING_RIDGE_AMP = 3.2;
+const PEERING_RIDGE_WIDTH = 18;
+const NOISE_AMP = 1.4;
 const NOISE_FREQ = 0.05;
-const SMOOTH_PASSES = 4;        // blend hard splats into rolling terrain
-const EDGE_FALLOFF_FRAC = 0.85; // smoother fade at the map border
+const SMOOTH_PASSES = 2;        // light blur — preserves VM peaks along ridges
+const EDGE_FALLOFF_FRAC = 0.85;
 const BASE_GROUND = 0.0;
 const CONTOUR_BANDS = 18;
 const COLOR_HIGH_PCT = 0.985;
