@@ -1,9 +1,9 @@
 import type { Graph, World, PlacedVm, PlacedSubnet, PlacedVnet, Subnet, Vm } from './types';
 
-const VM_SPACING = 3;          // grid pitch between VM towers within a subnet
-const VM_PAD = 2;              // padding around the VM grid on a subnet pad
-const SUBNET_GAP = 6;          // gap between subnet pads inside a VNet
-const VNET_GAP = 24;           // gap between VNet plots
+const VM_SPACING = 5;          // grid pitch between houses within a subnet
+const VM_PAD = 3;              // padding around house grid on a subnet plot
+const SUBNET_GAP = 8;          // gap between subnet plots (room for streets)
+const VNET_GAP = 32;           // gap between hills
 const MAX_TOWER = 32;          // tallest VM tower, in blocks
 const MIN_TOWER = 1;
 
