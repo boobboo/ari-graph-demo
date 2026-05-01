@@ -1,20 +1,49 @@
+// SimCity 3000 layout (PRD §6).
+//
+// Four-pass layout:
+//   1. Region rectangles (one per Azure region in use)
+//   2. Subscription rectangles within each region
+//   3. ResourceGroup district rectangles within each subscription (treemap-ish)
+//   4. Buildings within each district, placed by catalogue footprint
+//
+// Network topology is then overlaid: VNets become avenues threading through
+// subnet centroids that we derive from where the buildings ended up. RGs are
+// the physical home of every resource; VNets/Subnets are network-only and do
+// NOT drive placement in this mode.
+//
+// v1 uses simple proportional-grid packing rather than full squarified
+// treemap or force-directed placement (PRD §6 — deferred).
+
 import type {
-  Graph, World, PlacedVm, PlacedSubnet, PlacedVnet, Subnet, Vm,
+  Graph, World,
+  Vm, Vnet, Subnet, Peering,
+  PlacedRegion, PlacedSubscription, PlacedResourceGroup,
+  PlacedVm, PlacedSubnet, PlacedVnet,
   PlacedNic, PlacedNsg, PlacedPublicIp, PlacedStorage,
 } from './types';
+import { lookup as lookupCatalogue, ZONE_TINT } from './catalogue';
 
-const VM_SPACING = 4;          // grid pitch between tower plots within a subnet
-const VM_PAD = 3;              // padding around the tower grid on a subnet plot
-const SUBNET_GAP = 8;          // gap between subnet plots (room for streets)
-const VNET_GAP = 36;           // gap between districts (room for inter-district roads)
-const STORAGE_PITCH = 7;       // X-pitch between storage car parks
-const STORAGE_ROW_PITCH = 8;   // Z-pitch between rows in the strip
-const STORAGE_RG_GAP = 4;      // extra X-gap between RG groups (only when not wrapping)
-const STORAGE_OFFSET = 22;     // distance of services strip below the VNet bounds
-const MAX_TOWER = 32;          // tallest VM tower, in blocks
-const MIN_TOWER = 1;
+// Tile size in world units. A 1x1 building occupies one tile; a 2x2 occupies
+// four tiles (a 2x2 square). PRD §5.6 fixes footprints at 1, 2, 3, 4.
+const TILE = 3.0;
+const TILE_GAP = 0.5;             // a small kerb gap between tiles
+const RG_PADDING = 4;
+const SUB_PADDING = 6;
+const REGION_PADDING = 12;
+const RG_GAP = 6;
+const SUB_GAP = 12;
+const REGION_GAP = 24;
 
-// FNV-1a-ish hash → 0..1
+// ---- Helpers -----------------------------------------------------------
+function norm(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function gridSide(n: number): number {
+  return Math.max(1, Math.ceil(Math.sqrt(Math.max(1, n))));
+}
+
+// FNV-1a-ish hash → 0..1, used for VNet road colours.
 function hash01(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
@@ -26,11 +55,8 @@ function hash01(s: string): number {
 
 function vnetColor(name: string): number {
   const hue = hash01(name);
-  // Soft daylight-ish palette: medium saturation, mid-light value.
-  // Convert HSL → hex.
   const h = hue * 360;
-  const s = 0.45;
-  const l = 0.55;
+  const s = 0.55, l = 0.42;
   const c = (1 - Math.abs(2 * l - 1)) * s;
   const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
   const m = l - c / 2;
@@ -41,296 +67,469 @@ function vnetColor(name: string): number {
   else if (h < 240)  { g = x; b = c; }
   else if (h < 300)  { r = x; b = c; }
   else               { r = c; b = x; }
-  const R = Math.round((r + m) * 255);
-  const G = Math.round((g + m) * 255);
-  const B = Math.round((b + m) * 255);
-  return (R << 16) | (G << 8) | B;
+  return (Math.round((r + m) * 255) << 16) | (Math.round((g + m) * 255) << 8) | Math.round((b + m) * 255);
 }
 
-function gridSide(n: number): number {
-  return Math.max(1, Math.ceil(Math.sqrt(Math.max(1, n))));
+const rgIdOf = (sub: string, rg: string) => norm(`${sub || '(no subscription)'}::${rg || '(no rg)'}`);
+
+// ---- Pass 4: building tiles inside one RG -----------------------------
+interface Building {
+  refType: 'vm' | 'storage' | 'nsg' | 'publicIp';
+  refId: string;
+  footprint: number;             // 1..4 from catalogue
+  storeys: number;
+  zone: string;
+  building: string;
+  /** Sort key so similar zones cluster within the RG. */
+  zoneSortKey: number;
 }
 
-function subnetSize(vmCount: number): number {
-  const side = gridSide(vmCount);
-  return side * VM_SPACING + VM_PAD * 2;
+const ZONE_ORDER: Record<string, number> = {
+  'R-Light': 0, 'R-Medium': 1, 'R-Dense': 2,
+  'C-Light': 3, 'C-Medium': 4, 'C-Dense': 5,
+  'I-Light': 6, 'I-Medium': 7, 'I-Dense': 8,
+  'Civic':   9, 'Utility':  10,
+};
+
+function buildingFor(refType: Building['refType'], r: { sku?: string; vCPU?: number; ramGB?: number; kind?: string; tier?: 'hot'|'cool'|'archive'|'unknown' }): Omit<Building, 'refId'> | null {
+  const entry = lookupCatalogue(refType);
+  if (!entry) return null;
+  return {
+    refType,
+    footprint: entry.footprint,
+    storeys: entry.storeysFor(r),
+    zone: entry.zone,
+    building: entry.building,
+    zoneSortKey: ZONE_ORDER[entry.zone] ?? 99,
+  };
+}
+
+interface RgPlacement {
+  width: number;               // X extent of the RG (world units)
+  depth: number;               // Z extent
+  slots: Map<string, [number, number, number]>;  // refId -> [x, z, footprintTiles]
+}
+
+/**
+ * Place a list of buildings inside a single RG using a row-major grid.
+ * Each row's height is the max footprint of buildings in that row.
+ * Returns local positions (relative to the RG centre).
+ */
+function placeBuildings(buildings: Building[]): RgPlacement {
+  if (buildings.length === 0) {
+    return { width: TILE * 2 + RG_PADDING * 2, depth: TILE * 2 + RG_PADDING * 2, slots: new Map() };
+  }
+  // Sort so the same zones cluster (R together, I together, civic at the edge).
+  const sorted = [...buildings].sort((a, b) =>
+    a.zoneSortKey - b.zoneSortKey || b.footprint - a.footprint
+  );
+
+  // Decide a target row width in tile units. Aim for ~sqrt(totalTiles).
+  const totalTiles = sorted.reduce((s, b) => s + b.footprint * b.footprint, 0);
+  const targetCols = Math.max(2, Math.ceil(Math.sqrt(totalTiles) * 1.1));
+
+  // Pack row-by-row left-to-right.
+  let row = 0, col = 0, rowHeight = 0, maxRowEnd = 0;
+  const placements: Array<{ b: Building; row: number; col: number; rowH: number }> = [];
+  for (const b of sorted) {
+    if (col + b.footprint > targetCols && col > 0) {
+      // wrap to next row
+      row += rowHeight;
+      col = 0;
+      rowHeight = 0;
+    }
+    rowHeight = Math.max(rowHeight, b.footprint);
+    placements.push({ b, row, col, rowH: 0 /* filled after row settles */ });
+    col += b.footprint;
+    if (col > maxRowEnd) maxRowEnd = col;
+  }
+  // The last row's height was the active rowHeight.
+  let totalRows = row + rowHeight;
+
+  // Convert tile coords to world units.
+  const widthTiles = Math.max(maxRowEnd, 1);
+  const depthTiles = Math.max(totalRows, 1);
+  const tilePitch = TILE + TILE_GAP;
+  const width = widthTiles * tilePitch + RG_PADDING * 2;
+  const depth = depthTiles * tilePitch + RG_PADDING * 2;
+  const originX = -width / 2 + RG_PADDING + tilePitch / 2;
+  const originZ = -depth / 2 + RG_PADDING + tilePitch / 2;
+
+  const slots = new Map<string, [number, number, number]>();
+  for (const p of placements) {
+    // Centre the building's footprint inside its tile span.
+    const cx = originX + (p.col + (p.b.footprint - 1) / 2) * tilePitch;
+    const cz = originZ + (p.row + (p.b.footprint - 1) / 2) * tilePitch;
+    slots.set(p.b.refId, [cx, cz, p.b.footprint]);
+  }
+  return { width, depth, slots };
 }
 
 export function buildWorld(graph: Graph): World {
-  // Synthetic "unattached" subnet for VMs without a NIC link.
-  const orphanVms = graph.vms.filter(v => !v.subnetId);
-  let allSubnets = [...graph.subnets];
-  let vmsBySubnet = new Map(graph.vmsBySubnet);
-  let subnetsByVnet = new Map<string, Subnet[]>();
-  for (const [k, v] of graph.subnetsByVnet) subnetsByVnet.set(k, [...v]);
-  let vnets = [...graph.vnets];
-
-  if (orphanVms.length > 0) {
-    const ghostVnet = { id: '__unattached__', name: '(unattached)', rg: '', location: '', addressSpace: '' };
-    const ghostSubnet: Subnet = { id: '__unattached__::orphans', name: 'orphans', vnetId: '__unattached__', cidr: '' };
-    vnets = [...vnets, ghostVnet];
-    allSubnets = [...allSubnets, ghostSubnet];
-    subnetsByVnet.set(ghostVnet.id, [ghostSubnet]);
-    const linked = orphanVms.map(v => ({ ...v, subnetId: ghostSubnet.id })) as Vm[];
-    vmsBySubnet.set(ghostSubnet.id, linked);
-    // Replace orphan VMs in the working list with their linked copies.
-    const linkedById = new Map(linked.map(v => [v.id, v]));
-    graph = {
-      ...graph,
-      vms: graph.vms.map(v => linkedById.get(v.id) ?? v),
-    };
-  }
-
-  // Drop empty VNets that have no subnets.
-  vnets = vnets.filter(vn => (subnetsByVnet.get(vn.id)?.length ?? 0) > 0);
-
-  // ---- Composite height per VM (normalize vCPU & RAM across the file) ----
-  const vCPUs = graph.vms.map(v => v.vCPU).filter(n => Number.isFinite(n) && n > 0);
-  const rams = graph.vms.map(v => v.ramGB).filter(n => Number.isFinite(n) && n > 0);
-  const minC = Math.min(...vCPUs, 1);
-  const maxC = Math.max(...vCPUs, minC + 1);
-  const minR = Math.min(...rams, 1);
-  const maxR = Math.max(...rams, minR + 1);
-  const heightFor = (v: Vm) => {
-    const nc = (v.vCPU - minC) / Math.max(1e-6, maxC - minC);
-    const nr = (v.ramGB - minR) / Math.max(1e-6, maxR - minR);
-    const score = (clamp01(nc) + clamp01(nr)) / 2;
-    return Math.max(MIN_TOWER, Math.min(MAX_TOWER, Math.round(MIN_TOWER + score * (MAX_TOWER - MIN_TOWER))));
+  // ---- Build the per-RG building list -----------------------------------
+  // Every parsed resource (VM, Storage, NSG, PIP) becomes a building inside
+  // its (subscription::rg) district. Resources that lack an RG are pooled
+  // into a synthetic "(no rg)" district per subscription.
+  const buildingsByRg = new Map<string, Building[]>();
+  const pushBuilding = (subName: string, rgName: string, b: Building | null) => {
+    if (!b) return;
+    const id = rgIdOf(subName, rgName);
+    if (!buildingsByRg.has(id)) buildingsByRg.set(id, []);
+    buildingsByRg.get(id)!.push(b);
   };
-
-  // ---- VNet outer grid ----
-  const vnetSizes = new Map<string, number>();
-  for (const vn of vnets) {
-    const subs = subnetsByVnet.get(vn.id) ?? [];
-    const subSizes = subs.map(s => subnetSize((vmsBySubnet.get(s.id) ?? []).length));
-    const subnetSide = gridSide(subs.length);
-    const cellSize = Math.max(VM_SPACING * 2, ...subSizes);
-    const side = subnetSide * cellSize + (subnetSide - 1) * SUBNET_GAP + VM_SPACING * 2;
-    vnetSizes.set(vn.id, side);
+  for (const v of graph.vms) {
+    const proto = buildingFor('vm', v);
+    if (!proto) continue;
+    pushBuilding(v.subscription, v.rg, { ...proto, refId: v.id });
+  }
+  for (const s of graph.storage) {
+    const proto = buildingFor('storage', s);
+    if (!proto) continue;
+    pushBuilding(/* sub will be inferred from the RG hierarchy */ '', s.rg, { ...proto, refId: s.id });
+  }
+  for (const n of graph.nsgs) {
+    const proto = buildingFor('nsg', {});
+    if (!proto) continue;
+    pushBuilding('', n.rg, { ...proto, refId: n.id });
+  }
+  for (const p of graph.publicIps) {
+    const proto = buildingFor('publicIp', {});
+    if (!proto) continue;
+    pushBuilding('', p.rg, { ...proto, refId: p.id });
+  }
+  // Resources with no subscription resolve to whatever subscription their RG
+  // ended up in (parser already propagates subscription per RG when possible).
+  // Re-key buckets that landed under "(no subscription)" but now belong to a
+  // resolved RG.
+  const rgIdAlias = new Map<string, string>();      // rough → canonical
+  for (const rg of graph.resourceGroups) {
+    rgIdAlias.set(rgIdOf('', rg.name), rg.id);
+    rgIdAlias.set(rg.id, rg.id);
+  }
+  const reKeyed = new Map<string, Building[]>();
+  for (const [id, bs] of buildingsByRg) {
+    const canonical = rgIdAlias.get(id) ?? id;
+    if (!reKeyed.has(canonical)) reKeyed.set(canonical, []);
+    reKeyed.get(canonical)!.push(...bs);
   }
 
-  const vnetSide = gridSide(vnets.length);
-  // Use the largest VNet size as the cell pitch so layouts stay rectilinear.
-  const maxVnetSize = Math.max(...vnets.map(v => vnetSizes.get(v.id) ?? VM_SPACING * 4), VM_SPACING * 4);
-  const vnetCellPitch = maxVnetSize + VNET_GAP;
-  const totalSpan = vnetSide * maxVnetSize + (vnetSide - 1) * VNET_GAP;
-  const originX = -totalSpan / 2 + maxVnetSize / 2;
-  const originZ = -totalSpan / 2 + maxVnetSize / 2;
+  // ---- Pass 4 (per RG): compute placements ------------------------------
+  const rgPlacements = new Map<string, RgPlacement>();
+  for (const rg of graph.resourceGroups) {
+    rgPlacements.set(rg.id, placeBuildings(reKeyed.get(rg.id) ?? []));
+  }
 
-  const placedVnets: PlacedVnet[] = [];
-  const placedSubnets: PlacedSubnet[] = [];
-  const placedVms: PlacedVm[] = [];
-
-  vnets.forEach((vn, idx) => {
-    const gx = idx % vnetSide;
-    const gz = Math.floor(idx / vnetSide);
-    const cx = originX + gx * vnetCellPitch;
-    const cz = originZ + gz * vnetCellPitch;
-    const size = vnetSizes.get(vn.id) ?? maxVnetSize;
-    const color = vn.id === '__unattached__' ? 0x444a52 : vnetColor(vn.name);
-    placedVnets.push({ ...vn, center: [cx, cz], size, color });
-
-    const subs = subnetsByVnet.get(vn.id) ?? [];
-    const subSide = gridSide(subs.length);
-    const subSizes = subs.map(s => subnetSize((vmsBySubnet.get(s.id) ?? []).length));
-    const cellSize = Math.max(VM_SPACING * 2, ...subSizes);
-    const innerPitch = cellSize + SUBNET_GAP;
-    const innerSpan = subSide * cellSize + (subSide - 1) * SUBNET_GAP;
-    const innerOriginX = cx - innerSpan / 2 + cellSize / 2;
-    const innerOriginZ = cz - innerSpan / 2 + cellSize / 2;
-
-    subs.forEach((s, si) => {
-      const sx = si % subSide;
-      const sz = Math.floor(si / subSide);
-      const subCx = innerOriginX + sx * innerPitch;
-      const subCz = innerOriginZ + sz * innerPitch;
-      const localVms = vmsBySubnet.get(s.id) ?? [];
-      const ssize = subnetSize(localVms.length);
-      placedSubnets.push({ ...s, center: [subCx, subCz], size: ssize, vnetCenter: [cx, cz] });
-
-      // VMs on the subnet pad
-      const vside = gridSide(localVms.length);
-      const vmSpan = vside * VM_SPACING;
-      const vmOriginX = subCx - vmSpan / 2 + VM_SPACING / 2;
-      const vmOriginZ = subCz - vmSpan / 2 + VM_SPACING / 2;
-      localVms.forEach((vm, vi) => {
-        const vx = vi % vside;
-        const vz = Math.floor(vi / vside);
-        const x = vmOriginX + vx * VM_SPACING;
-        const z = vmOriginZ + vz * VM_SPACING;
-        const h = heightFor(vm);
-        placedVms.push({ ...vm, pos: [x, 0, z], height: h });
+  // ---- Pass 3: RGs within their Subscription ----------------------------
+  interface SubPlacement { width: number; depth: number; rgs: Array<{ rgId: string; cx: number; cz: number }>; }
+  const subPlacements = new Map<string, SubPlacement>();
+  for (const sub of graph.subscriptions) {
+    const rgs = sub.rgIds.map(id => graph.resourceGroups.find(r => r.id === id)).filter((x): x is NonNullable<typeof x> => Boolean(x));
+    if (rgs.length === 0) {
+      subPlacements.set(sub.id, { width: TILE * 4, depth: TILE * 4, rgs: [] });
+      continue;
+    }
+    // Simple grid layout; cell size = max RG dimension to keep things rectilinear.
+    const maxW = Math.max(...rgs.map(r => rgPlacements.get(r.id)?.width ?? TILE * 2));
+    const maxD = Math.max(...rgs.map(r => rgPlacements.get(r.id)?.depth ?? TILE * 2));
+    const cellW = maxW + RG_GAP;
+    const cellD = maxD + RG_GAP;
+    const cols = gridSide(rgs.length);
+    const rows = Math.ceil(rgs.length / cols);
+    const innerW = cols * cellW - RG_GAP;
+    const innerD = rows * cellD - RG_GAP;
+    const originX = -innerW / 2 + maxW / 2;
+    const originZ = -innerD / 2 + maxD / 2;
+    const placed: Array<{ rgId: string; cx: number; cz: number }> = [];
+    rgs.forEach((rg, i) => {
+      const c = i % cols, r = Math.floor(i / cols);
+      placed.push({
+        rgId: rg.id,
+        cx: originX + c * cellW,
+        cz: originZ + r * cellD,
       });
     });
+    subPlacements.set(sub.id, {
+      width: innerW + SUB_PADDING * 2,
+      depth: innerD + SUB_PADDING * 2,
+      rgs: placed,
+    });
+  }
+
+  // ---- Pass 2: Subscriptions within Region ------------------------------
+  interface RegionPlacement { width: number; depth: number; subs: Array<{ subId: string; cx: number; cz: number }>; }
+  const regionPlacements = new Map<string, RegionPlacement>();
+  for (const region of graph.regions) {
+    const subs = region.subIds.map(id => graph.subscriptions.find(s => s.id === id)).filter((x): x is NonNullable<typeof x> => Boolean(x));
+    if (subs.length === 0) {
+      regionPlacements.set(region.id, { width: TILE * 4, depth: TILE * 4, subs: [] });
+      continue;
+    }
+    const maxW = Math.max(...subs.map(s => subPlacements.get(s.id)?.width ?? TILE * 4));
+    const maxD = Math.max(...subs.map(s => subPlacements.get(s.id)?.depth ?? TILE * 4));
+    const cellW = maxW + SUB_GAP;
+    const cellD = maxD + SUB_GAP;
+    const cols = gridSide(subs.length);
+    const rows = Math.ceil(subs.length / cols);
+    const innerW = cols * cellW - SUB_GAP;
+    const innerD = rows * cellD - SUB_GAP;
+    const originX = -innerW / 2 + maxW / 2;
+    const originZ = -innerD / 2 + maxD / 2;
+    const placed: Array<{ subId: string; cx: number; cz: number }> = [];
+    subs.forEach((sub, i) => {
+      const c = i % cols, r = Math.floor(i / cols);
+      placed.push({ subId: sub.id, cx: originX + c * cellW, cz: originZ + r * cellD });
+    });
+    regionPlacements.set(region.id, {
+      width: innerW + REGION_PADDING * 2,
+      depth: innerD + REGION_PADDING * 2,
+      subs: placed,
+    });
+  }
+
+  // ---- Pass 1: Regions in a row -----------------------------------------
+  const regionList = graph.regions;
+  const regionMaxW = Math.max(...regionList.map(r => regionPlacements.get(r.id)?.width ?? TILE * 4), TILE * 4);
+  const regionMaxD = Math.max(...regionList.map(r => regionPlacements.get(r.id)?.depth ?? TILE * 4), TILE * 4);
+  const regionCols = gridSide(regionList.length);
+  const regionRows = Math.ceil(regionList.length / regionCols);
+  const regionPitchX = regionMaxW + REGION_GAP;
+  const regionPitchZ = regionMaxD + REGION_GAP;
+  const regionInnerW = regionCols * regionPitchX - REGION_GAP;
+  const regionInnerD = regionRows * regionPitchZ - REGION_GAP;
+  const regionOriginX = -regionInnerW / 2 + regionMaxW / 2;
+  const regionOriginZ = -regionInnerD / 2 + regionMaxD / 2;
+
+  // ---- Now compose absolute world positions for everything --------------
+  const placedRegions: PlacedRegion[] = [];
+  const placedSubs: PlacedSubscription[] = [];
+  const placedRgs: PlacedResourceGroup[] = [];
+
+  // Map refId -> its absolute world (x, z) and the RG it belongs to.
+  const buildingPos = new Map<string, { x: number; z: number; rgId: string; footprint: number }>();
+
+  regionList.forEach((region, ri) => {
+    const rp = regionPlacements.get(region.id);
+    if (!rp) return;
+    const rcol = ri % regionCols;
+    const rrow = Math.floor(ri / regionCols);
+    const rcx = regionOriginX + rcol * regionPitchX;
+    const rcz = regionOriginZ + rrow * regionPitchZ;
+    placedRegions.push({ ...region, center: [rcx, rcz], width: rp.width, depth: rp.depth });
+
+    for (const sp of rp.subs) {
+      const sub = graph.subscriptions.find(s => s.id === sp.subId);
+      const subPlace = subPlacements.get(sp.subId);
+      if (!sub || !subPlace) continue;
+      const subCx = rcx + sp.cx;
+      const subCz = rcz + sp.cz;
+      placedSubs.push({ ...sub, regionId: region.id, center: [subCx, subCz], width: subPlace.width, depth: subPlace.depth });
+
+      for (const rgp of subPlace.rgs) {
+        const rg = graph.resourceGroups.find(r => r.id === rgp.rgId);
+        const rgPlace = rgPlacements.get(rgp.rgId);
+        if (!rg || !rgPlace) continue;
+        const rgCx = subCx + rgp.cx;
+        const rgCz = subCz + rgp.cz;
+        placedRgs.push({ ...rg, center: [rgCx, rgCz], width: rgPlace.width, depth: rgPlace.depth });
+
+        // Place each building in this RG.
+        for (const [refId, [lx, lz, fp]] of rgPlace.slots) {
+          buildingPos.set(refId, { x: rgCx + lx, z: rgCz + lz, rgId: rg.id, footprint: fp });
+        }
+      }
+    }
   });
+
+  // ---- Convert building positions to placed resource arrays --------------
+  const placedVms: PlacedVm[] = [];
+  for (const v of graph.vms) {
+    const slot = buildingPos.get(v.id);
+    if (!slot) continue;
+    const entry = lookupCatalogue('vm');
+    if (!entry) continue;
+    placedVms.push({
+      ...v,
+      pos: [slot.x, 0, slot.z],
+      height: entry.storeysFor(v),
+      rgId: slot.rgId,
+      zone: entry.zone,
+      building: entry.building,
+      storeys: entry.storeysFor(v),
+      footprint: slot.footprint,
+    });
+  }
+
+  const placedStorage: PlacedStorage[] = [];
+  for (const s of graph.storage) {
+    const slot = buildingPos.get(s.id);
+    if (!slot) continue;
+    const entry = lookupCatalogue('storage');
+    if (!entry) continue;
+    placedStorage.push({
+      ...s,
+      pos: [slot.x, slot.z],
+      storeys: entry.storeysFor(s),
+      rgId: slot.rgId,
+      zone: entry.zone,
+      building: entry.building,
+      footprint: slot.footprint,
+    });
+  }
+
+  // ---- Network overlay --------------------------------------------------
+  // Subnet centroids: average position of VMs whose nicLink lands in this
+  // subnet. If a subnet has no buildings, fall back to the centre of its
+  // VNet's home RG (just to keep the road from disappearing entirely).
+  const placedSubnets: PlacedSubnet[] = [];
+  const subnetCentroidById = new Map<string, [number, number]>();
+  for (const subnet of graph.subnets) {
+    const memberVms = placedVms.filter(v => v.subnetId === subnet.id);
+    if (memberVms.length > 0) {
+      const cx = memberVms.reduce((s, v) => s + v.pos[0], 0) / memberVms.length;
+      const cz = memberVms.reduce((s, v) => s + v.pos[2], 0) / memberVms.length;
+      subnetCentroidById.set(subnet.id, [cx, cz]);
+    } else {
+      // No buildings reference this subnet — derive from its VNet's RG centre.
+      // VNet's RG is unknown to us in v1; just stash at world origin and skip
+      // road drawing for it.
+      subnetCentroidById.set(subnet.id, [0, 0]);
+    }
+  }
+  for (const subnet of graph.subnets) {
+    const c = subnetCentroidById.get(subnet.id)!;
+    placedSubnets.push({
+      ...subnet,
+      center: c,
+      size: 4,                         // small marker
+      vnetCenter: c,                   // for back-compat (unused in new mode)
+    });
+  }
+
+  // VNets: centroid + member subnets. Color is hashed from name; the avenue
+  // mesh in world.ts uses this to draw a polyline through the subnets.
+  const placedVnets: PlacedVnet[] = [];
+  for (const vn of graph.vnets) {
+    const memberSubs = placedSubnets.filter(s => s.vnetId === vn.id);
+    let cx = 0, cz = 0;
+    if (memberSubs.length > 0) {
+      cx = memberSubs.reduce((sum, s) => sum + s.center[0], 0) / memberSubs.length;
+      cz = memberSubs.reduce((sum, s) => sum + s.center[1], 0) / memberSubs.length;
+    }
+    placedVnets.push({
+      ...vn,
+      center: [cx, cz],
+      size: 4,
+      color: vnetColor(vn.name),
+    });
+  }
+  // Synthetic VNets for orphan VMs (not attached to any subnet) get skipped —
+  // the building still renders inside its RG; it just doesn't appear on the
+  // road network.
 
   const vnetById = new Map(placedVnets.map(v => [v.id, v]));
   const subnetById = new Map(placedSubnets.map(s => [s.id, s]));
+  const rgById = new Map(placedRgs.map(r => [r.id, r]));
 
-  // ---- NICs: one shopfront per VM, on the side facing its subnet centre ----
-  // (Multi-NIC support comes via raw graph.vms when each VM may carry several;
-  // today the parser collapses to a single NIC per VM, which is the common case.)
+  // ---- NIC shopfronts ---------------------------------------------------
+  // Each NIC is a small storefront flush against the VM, facing the
+  // direction of its subnet's centroid (i.e. the road).
   const placedNics: PlacedNic[] = [];
   const vmIdByNicName = new Map<string, string>();
-  for (const vm of placedVms) {
-    if (vm.nicName) vmIdByNicName.set(norm(vm.nicName), vm.id);
-    if (!vm.subnetId) continue;
-    const sub = subnetById.get(vm.subnetId);
-    if (!sub) continue;
-    const dx = sub.center[0] - vm.pos[0];
-    const dz = sub.center[1] - vm.pos[2];
+  for (const v of placedVms) {
+    if (v.nicName) vmIdByNicName.set(norm(v.nicName), v.id);
+    if (!v.subnetId) continue;
+    const sc = subnetCentroidById.get(v.subnetId);
+    if (!sc) continue;
+    const dx = sc[0] - v.pos[0];
+    const dz = sc[1] - v.pos[2];
     const len = Math.hypot(dx, dz) || 1;
     const fx = dx / len, fz = dz / len;
     placedNics.push({
-      vmId: vm.id,
-      subnetId: vm.subnetId,
-      privateIp: vm.privateIp ?? '',
-      pos: [vm.pos[0] + fx * (VM_SPACING * 0.32), vm.pos[2] + fz * (VM_SPACING * 0.32)],
+      vmId: v.id,
+      subnetId: v.subnetId,
+      privateIp: v.privateIp ?? '',
+      pos: [v.pos[0] + fx * (TILE * 0.4), v.pos[2] + fz * (TILE * 0.4)],
       facing: [fx, fz],
     });
   }
-  const nicByVmId = new Map(placedNics.map(n => [n.vmId, n]));
 
-  // ---- NSGs: subnet-attached at the subnet "gate"; NIC-attached next to the VM ----
+  // ---- NSG placements --------------------------------------------------
+  // NSGs are buildings inside their RG (placed in Pass 4). We fill in the
+  // placedNsgs array by reading the building positions and noting what they
+  // protect (for later coverage-radius rendering).
   const placedNsgs: PlacedNsg[] = [];
   for (const nsg of graph.nsgs) {
+    const slot = buildingPos.get(nsg.id);
+    if (!slot) continue;
+    // Facing: orient the barrier arm toward the subnet it protects (if any),
+    // otherwise toward the RG centre.
+    let fx = 0, fz = 1;
     if (nsg.subnetId) {
-      const sub = subnetById.get(nsg.subnetId);
-      if (!sub) continue;
-      // Gate edge = the side of the subnet facing the VNet centre.
-      const dx = sub.vnetCenter[0] - sub.center[0];
-      const dz = sub.vnetCenter[1] - sub.center[1];
-      const len = Math.hypot(dx, dz) || 1;
-      const fx = dx / len, fz = dz / len;
-      const edgeOffset = sub.size / 2 + 1.5;
-      placedNsgs.push({
-        ...nsg,
-        pos: [sub.center[0] + fx * edgeOffset, sub.center[1] + fz * edgeOffset],
-        facing: [-fz, fx],     // perpendicular to the road direction (the barrier sweep)
-        attachedSubnetId: nsg.subnetId,
-        attachedVmId: null,
-      });
-    } else if (nsg.nicName) {
-      const vmId = vmIdByNicName.get(norm(nsg.nicName));
-      const vm = vmId ? placedVms.find(v => v.id === vmId) : null;
-      if (!vm) continue;
-      const nic = nicByVmId.get(vm.id);
-      // Place beside the NIC shopfront, perpendicular to its facing direction.
-      const fx = nic?.facing[0] ?? 0;
-      const fz = nic?.facing[1] ?? 1;
-      const lateral = VM_SPACING * 0.55;
-      placedNsgs.push({
-        ...nsg,
-        pos: [vm.pos[0] + (-fz) * lateral + fx * 0.3, vm.pos[2] + fx * lateral + fz * 0.3],
-        facing: [fx, fz],
-        attachedSubnetId: null,
-        attachedVmId: vm.id,
-      });
+      const sc = subnetCentroidById.get(nsg.subnetId);
+      if (sc) {
+        const dx = sc[0] - slot.x;
+        const dz = sc[1] - slot.z;
+        const len = Math.hypot(dx, dz) || 1;
+        fx = dx / len; fz = dz / len;
+      }
     }
-  }
-
-  // ---- Public IPs: hover next to the NIC shopfront of the attached VM ----
-  const placedPublicIps: PlacedPublicIp[] = [];
-  for (const pip of graph.publicIps) {
-    if (!pip.attachedNic) continue;
-    const vmId = vmIdByNicName.get(norm(pip.attachedNic));
-    const vm = vmId ? placedVms.find(v => v.id === vmId) : null;
-    if (!vm) continue;
-    const nic = nicByVmId.get(vm.id);
-    const fx = nic?.facing[0] ?? 0;
-    const fz = nic?.facing[1] ?? 1;
-    const offset = VM_SPACING * 0.5;
-    placedPublicIps.push({
-      ...pip,
-      pos: [vm.pos[0] + fx * offset + (-fz) * (offset * 0.5),
-            vm.pos[2] + fz * offset + (fx) * (offset * 0.5)],
-      attachedVmId: vm.id,
+    placedNsgs.push({
+      ...nsg,
+      pos: [slot.x, slot.z],
+      facing: [fx, fz],
+      attachedSubnetId: nsg.subnetId,
+      attachedVmId: null,
     });
   }
 
-  // ---- Storage accounts: services strip along the south edge of the world ----
-  // Storage isn't network-attached, so it sits off the districts in its own
-  // grid: rows-by-cols grouped by RG. The grid wraps so a long inventory
-  // (hundreds of accounts) doesn't sprawl into a single 1km-long row.
-  const placedStorage: PlacedStorage[] = [];
-  if (graph.storage.length > 0) {
-    // Sort by RG, then name, so RG groups stay together.
-    const sorted = [...graph.storage].sort((a, b) =>
-      a.rg === b.rg ? a.name.localeCompare(b.name) : a.rg.localeCompare(b.rg));
-
-    // Aim for a roughly square grid: cols ≈ sqrt(n) * 1.4. Hard-cap so even
-    // tiny inventories don't end up as a single strip.
-    const cols = Math.max(6, Math.ceil(Math.sqrt(sorted.length) * 1.4));
-
-    const stripCx = placedVnets.length
-      ? placedVnets.reduce((sum, v) => sum + v.center[0], 0) / placedVnets.length
-      : 0;
-    const gridWidth = cols * STORAGE_PITCH;
-    const stripStartX = stripCx - gridWidth / 2 + STORAGE_PITCH / 2;
-    const stripStartZ = (placedVnets.length
-      ? Math.max(...placedVnets.map(v => v.center[1] + v.size / 2))
-      : 0) + STORAGE_OFFSET;
-
-    let col = 0, row = 0;
-    let prevRg: string | null = null;
-    for (const s of sorted) {
-      // RG break: bump to a new row if we've already used most of this row,
-      // otherwise just leave a small in-row gap.
-      const rgChanged = prevRg !== null && prevRg !== s.rg;
-      if (rgChanged && col > cols - 3) { col = 0; row++; }
-      const x = stripStartX + col * STORAGE_PITCH + (rgChanged && col > 0 ? STORAGE_RG_GAP : 0);
-      const z = stripStartZ + row * STORAGE_ROW_PITCH;
-      // Storeys: bigger SKU/kind → taller car park.
-      const skuLow = s.sku.toLowerCase();
-      const kindLow = s.kind.toLowerCase();
-      let storeys = 3;
-      if (skuLow.includes('premium')) storeys += 2;
-      if (skuLow.includes('zrs') || skuLow.includes('grs')) storeys += 1;
-      if (kindLow.includes('blob')) storeys += 1;
-      if (s.tier === 'archive') storeys = Math.max(2, storeys - 1);
-      placedStorage.push({ ...s, pos: [x, z], storeys });
-      col++;
-      if (col >= cols) { col = 0; row++; }
-      prevRg = s.rg;
+  // ---- Public IPs ------------------------------------------------------
+  // Public IPs are now civic toll-booth buildings inside their RG. We keep
+  // attachedVmId resolution so the tooltip can still link back to a NIC.
+  const placedPublicIps: PlacedPublicIp[] = [];
+  for (const pip of graph.publicIps) {
+    const slot = buildingPos.get(pip.id);
+    if (!slot) continue;
+    let attachedVmId: string | null = null;
+    if (pip.attachedNic) {
+      const vid = vmIdByNicName.get(norm(pip.attachedNic));
+      if (vid) attachedVmId = vid;
     }
+    placedPublicIps.push({
+      ...pip,
+      pos: [slot.x, slot.z],
+      attachedVmId,
+    });
   }
 
-  // ---- Bounds: include the services strip too so the camera can frame it ----
-  const xs = placedVnets.flatMap(v => [v.center[0] - v.size / 2, v.center[0] + v.size / 2]);
-  const zs = placedVnets.flatMap(v => [v.center[1] - v.size / 2, v.center[1] + v.size / 2]);
-  const stripXs = placedStorage.map(s => s.pos[0]);
-  const stripZs = placedStorage.map(s => s.pos[1]);
+  // ---- World bounds ----------------------------------------------------
+  const allXs = placedRegions.flatMap(r => [r.center[0] - r.width / 2, r.center[0] + r.width / 2]);
+  const allZs = placedRegions.flatMap(r => [r.center[1] - r.depth / 2, r.center[1] + r.depth / 2]);
   const bounds = {
-    min: [
-      Math.min(...xs, ...stripXs.map(x => x - STORAGE_PITCH / 2), -10),
-      Math.min(...zs, ...stripZs.map(z => z - 4), -10),
-    ] as [number, number],
-    max: [
-      Math.max(...xs, ...stripXs.map(x => x + STORAGE_PITCH / 2), 10),
-      Math.max(...zs, ...stripZs.map(z => z + 4), 10),
-    ] as [number, number],
+    min: [Math.min(...allXs, -10), Math.min(...allZs, -10)] as [number, number],
+    max: [Math.max(...allXs,  10), Math.max(...allZs,  10)] as [number, number],
   };
 
+  // Suppress unused-import warnings for types still imported for back-compat.
+  void (null as unknown as Vm | Vnet | Subnet | Peering);
+
   return {
+    regions: placedRegions,
+    subscriptions: placedSubs,
+    resourceGroups: placedRgs,
     vms: placedVms,
+    storage: placedStorage,
+    nsgs: placedNsgs,
+    publicIps: placedPublicIps,
     subnets: placedSubnets,
     vnets: placedVnets,
     peerings: graph.peerings,
     nics: placedNics,
-    nsgs: placedNsgs,
-    publicIps: placedPublicIps,
-    storage: placedStorage,
     bounds,
     vnetById,
     subnetById,
+    rgById,
   };
 }
 
-function norm(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function clamp01(n: number): number {
-  if (!Number.isFinite(n)) return 0;
-  return Math.min(1, Math.max(0, n));
-}
+// Re-export the zone tint table so world.ts can use the same source-of-truth.
+export { ZONE_TINT };

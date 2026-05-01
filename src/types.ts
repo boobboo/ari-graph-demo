@@ -67,6 +67,12 @@ export interface StorageAccount {
 }
 
 export interface Graph {
+  // Hierarchy (derived in parser from resource location/subscription/RG)
+  regions: Region[];
+  subscriptions: Subscription[];
+  resourceGroups: ResourceGroup[];
+
+  // Resources
   vms: Vm[];
   vnets: Vnet[];
   subnets: Subnet[];
@@ -74,6 +80,7 @@ export interface Graph {
   nsgs: Nsg[];
   publicIps: PublicIp[];
   storage: StorageAccount[];
+
   vmsBySubnet: Map<string, Vm[]>;
   subnetsByVnet: Map<string, Subnet[]>;
   detection: {
@@ -83,9 +90,68 @@ export interface Graph {
   notes: string[];
 }
 
+// ---- Estate hierarchy (PRD §5.1) ---------------------------------------
+// Region (Azure region) -> Subscription -> ResourceGroup -> Resource.
+// Replaces VNet-as-container with RG-as-district. VNets/Subnets become
+// derived network overlays in the World layer.
+
+export interface Region {
+  id: string;             // normalised location name
+  name: string;           // display name (original casing)
+  subIds: string[];       // subscriptions present in this region
+}
+
+export interface Subscription {
+  id: string;             // normalised name
+  name: string;
+  rgIds: string[];        // RGs present in this subscription
+}
+
+export interface ResourceGroup {
+  id: string;             // norm("<sub>::<rg>")
+  name: string;           // RG display name
+  subscriptionId: string;
+  regionId: string;       // a single primary region; resources in other
+                          // regions of the same RG are still placed here
+                          // but tinted as out-of-region for v2.
+  /** Canonical resource types present (vm, storage, nsg, ...). */
+  resourceTypes: string[];
+  /** R/C/I bias (computed at parse time). */
+  rciR: number; rciC: number; rciI: number;
+  rciPrimary: 'R' | 'C' | 'I' | 'Mixed';
+}
+
+// ---- Placed types ------------------------------------------------------
+// Resources are now placed inside their RG. Subnets/VNets are derived from
+// resource positions (computed in layout.ts after Pass 4).
+
+export interface PlacedRegion extends Region {
+  center: [number, number];
+  width: number;
+  depth: number;
+}
+
+export interface PlacedSubscription extends Subscription {
+  center: [number, number];
+  width: number;
+  depth: number;
+  regionId: string;
+}
+
+export interface PlacedResourceGroup extends ResourceGroup {
+  center: [number, number];
+  width: number;
+  depth: number;
+}
+
 export interface PlacedVm extends Vm {
   pos: [number, number, number];
-  height: number;
+  height: number;            // legacy composite (kept for backwards-compat)
+  rgId: string;              // which RG this VM physically belongs to
+  zone: string;              // RCI class from catalogue
+  building: string;          // building archetype from catalogue
+  storeys: number;           // catalogue-derived storey count
+  footprint: number;         // catalogue-derived tile footprint
 }
 
 export interface PlacedSubnet extends Subnet {
@@ -124,20 +190,34 @@ export interface PlacedPublicIp extends PublicIp {
 }
 
 export interface PlacedStorage extends StorageAccount {
-  pos: [number, number];     // ground-plane position in the services strip
-  storeys: number;           // how many floors of car park to draw
+  pos: [number, number];     // ground-plane position inside its RG district
+  storeys: number;
+  rgId: string;
+  zone: string;
+  building: string;
+  footprint: number;
 }
 
 export interface World {
+  // Hierarchy (PRD §5.1)
+  regions: PlacedRegion[];
+  subscriptions: PlacedSubscription[];
+  resourceGroups: PlacedResourceGroup[];
+
+  // Buildings — placed inside their RG by the catalogue.
   vms: PlacedVm[];
+  storage: PlacedStorage[];
+  nsgs: PlacedNsg[];
+  publicIps: PlacedPublicIp[];
+
+  // Network overlay — derived in layout, drawn as roads/markers in world.
   subnets: PlacedSubnet[];
   vnets: PlacedVnet[];
   peerings: Peering[];
   nics: PlacedNic[];
-  nsgs: PlacedNsg[];
-  publicIps: PlacedPublicIp[];
-  storage: PlacedStorage[];
+
   bounds: { min: [number, number]; max: [number, number] };
   vnetById: Map<string, PlacedVnet>;
   subnetById: Map<string, PlacedSubnet>;
+  rgById: Map<string, PlacedResourceGroup>;
 }

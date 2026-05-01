@@ -1,6 +1,10 @@
 import * as XLSX from 'xlsx';
-import type { Graph, Vm, Vnet, Subnet, Peering, Nsg, PublicIp, StorageAccount, StorageTier } from './types';
+import type {
+  Graph, Vm, Vnet, Subnet, Peering, Nsg, PublicIp, StorageAccount, StorageTier,
+  Region, Subscription, ResourceGroup,
+} from './types';
 import { lookupSku } from './sku';
+import { computeRciBias } from './catalogue';
 
 type Row = Record<string, unknown>;
 
@@ -340,8 +344,87 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   if (orphanCount > 0) notes.push(`${orphanCount} VM(s) could not be linked to a subnet — placed in an "unattached" pad.`);
   if (!detection.nic) notes.push(`No NIC sheet found — VM/subnet links inferred from the VM sheet.`);
 
+  // ---- Derive hierarchy: Region -> Subscription -> ResourceGroup --------
+  // Every parsed resource carries a (subscription, location, rg) triple. Roll
+  // them up into the four-level estate model the SimCity 3000 layout consumes.
+  type Bucket = { type: string; sub: string; loc: string; rg: string };
+  const bucket: Bucket[] = [];
+  for (const v of vms)        bucket.push({ type: 'vm',        sub: v.subscription, loc: v.location, rg: v.rg });
+  for (const s of storage)    bucket.push({ type: 'storage',   sub: '',             loc: s.location, rg: s.rg });
+  for (const n of nsgs)       bucket.push({ type: 'nsg',       sub: '',             loc: n.location, rg: n.rg });
+  for (const p of publicIps)  bucket.push({ type: 'publicIp',  sub: '',             loc: p.location, rg: p.rg });
+  // Storage/NSG/PIP rows lack subscription in some ARI exports — propagate the
+  // VM subscription if they share an RG. This keeps single-sub estates (the
+  // common case) coherent.
+  const subByRg = new Map<string, string>();
+  for (const b of bucket) if (b.type === 'vm' && b.sub && b.rg) subByRg.set(b.rg, b.sub);
+  for (const b of bucket) if (!b.sub && b.rg && subByRg.has(b.rg)) b.sub = subByRg.get(b.rg)!;
+
+  // Regions
+  const regionMap = new Map<string, Region>();
+  for (const b of bucket) {
+    if (!b.loc) continue;
+    const id = norm(b.loc);
+    if (!regionMap.has(id)) regionMap.set(id, { id, name: b.loc, subIds: [] });
+  }
+  if (regionMap.size === 0) regionMap.set('__unknown__', { id: '__unknown__', name: '(unknown region)', subIds: [] });
+
+  // Subscriptions
+  const subMap = new Map<string, Subscription>();
+  for (const b of bucket) {
+    const subName = b.sub || '(no subscription)';
+    const id = norm(subName);
+    if (!subMap.has(id)) subMap.set(id, { id, name: subName, rgIds: [] });
+  }
+
+  // Resource groups (id is sub::rg-name to avoid name collisions across subs)
+  const rgMap = new Map<string, ResourceGroup>();
+  const rgTypes = new Map<string, Set<string>>();
+  for (const b of bucket) {
+    const rgName = b.rg || '(no rg)';
+    const subName = b.sub || '(no subscription)';
+    const subId = norm(subName);
+    const rgId = norm(`${subName}::${rgName}`);
+    const regionId = b.loc ? norm(b.loc) : '__unknown__';
+    if (!rgMap.has(rgId)) {
+      rgMap.set(rgId, {
+        id: rgId, name: rgName, subscriptionId: subId, regionId,
+        resourceTypes: [],
+        rciR: 0, rciC: 0, rciI: 0, rciPrimary: 'Mixed',
+      });
+      rgTypes.set(rgId, new Set());
+    }
+    rgTypes.get(rgId)!.add(b.type);
+  }
+  // Fill RCI bias + resourceTypes
+  for (const [rgId, types] of rgTypes) {
+    const rg = rgMap.get(rgId)!;
+    rg.resourceTypes = [...types];
+    const bias = computeRciBias(rg.resourceTypes);
+    rg.rciR = bias.R; rg.rciC = bias.C; rg.rciI = bias.I; rg.rciPrimary = bias.primary;
+  }
+
+  // Wire sub -> rgs and region -> subs
+  for (const rg of rgMap.values()) {
+    const sub = subMap.get(rg.subscriptionId);
+    if (sub && !sub.rgIds.includes(rg.id)) sub.rgIds.push(rg.id);
+    const region = regionMap.get(rg.regionId);
+    if (region && !region.subIds.includes(rg.subscriptionId)) region.subIds.push(rg.subscriptionId);
+  }
+
+  const regionsArr = [...regionMap.values()];
+  const subsArr = [...subMap.values()];
+  const rgsArr = [...rgMap.values()];
+
   log(`Parsed: ${vms.length} VMs · ${vnets.length} VNets · ${subnets.length} subnets · ${peerings.length} peerings · ${nsgs.length} NSGs · ${publicIps.length} PIPs · ${storage.length} storage`);
+  log(`Hierarchy: ${regionsArr.length} regions · ${subsArr.length} subscriptions · ${rgsArr.length} resource groups`);
   if (notes.length) for (const n of notes) log(`  · ${n}`);
 
-  return { vms, vnets, subnets, peerings, nsgs, publicIps, storage, vmsBySubnet, subnetsByVnet, detection, notes };
+  return {
+    regions: regionsArr,
+    subscriptions: subsArr,
+    resourceGroups: rgsArr,
+    vms, vnets, subnets, peerings, nsgs, publicIps, storage,
+    vmsBySubnet, subnetsByVnet, detection, notes,
+  };
 }
