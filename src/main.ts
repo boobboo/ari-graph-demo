@@ -165,7 +165,7 @@ function formatService(tip: ServiceTip): string {
     if (p.sku) rows.push(`SKU: ${escapeHtml(p.sku)}`);
     if (p.attachedNic) rows.push(`NIC: ${escapeHtml(p.attachedNic)}`);
     if (p.rg) rows.push(`RG: ${escapeHtml(p.rg)}`);
-  } else {
+  } else if (tip.kind === 'storage') {
     const s = tip.data;
     rows.push(`<b>${escapeHtml(s.name)}</b> · Storage`);
     if (s.kind) rows.push(`Kind: ${escapeHtml(s.kind)}`);
@@ -173,6 +173,16 @@ function formatService(tip: ServiceTip): string {
     if (s.tier && s.tier !== 'unknown') rows.push(`Tier: ${escapeHtml(s.tier)}`);
     if (s.rg) rows.push(`RG: ${escapeHtml(s.rg)}`);
     if (s.location) rows.push(`Region: ${escapeHtml(s.location)}`);
+  } else {
+    const o = tip.data;
+    rows.push(`<b>${escapeHtml(o.name)}</b> · ${escapeHtml(o.kind)}`);
+    if (o.sku) rows.push(`SKU: ${escapeHtml(o.sku)}`);
+    if (o.sizeGB) rows.push(`Size: ${o.sizeGB} GB`);
+    if (o.rg) rows.push(`RG: ${escapeHtml(o.rg)}`);
+    if (o.location) rows.push(`Region: ${escapeHtml(o.location)}`);
+    for (const [k, v] of Object.entries(o.extras).slice(0, 4)) {
+      rows.push(`${escapeHtml(k)}: ${escapeHtml(v)}`);
+    }
   }
   return rows.join('<br/>');
 }

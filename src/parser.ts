@@ -1,7 +1,7 @@
 import * as XLSX from 'xlsx';
 import type {
   Graph, Vm, Vnet, Subnet, Peering, Nsg, PublicIp, StorageAccount, StorageTier,
-  Region, Subscription, ResourceGroup,
+  Region, Subscription, ResourceGroup, OtherResource, AzureResourceKind,
 } from './types';
 import { lookupSku } from './sku';
 import { computeRciBias } from './catalogue';
@@ -87,6 +87,50 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   const nsgSheet     = findSheet(wb, ['Network Security Groups', 'NSG', 'NetworkSecurityGroups', 'NSGs']);
   const pipSheet     = findSheet(wb, ['Public IPs', 'Public IP Addresses', 'PublicIP', 'Public IP']);
   const storageSheet = findSheet(wb, ['Storage Accounts', 'Storage', 'StorageAccount', 'StorageAccounts']);
+  // ---- Phase 2 catalogue extension: extra sheets per PRD §5.2 ----
+  const sheetCatalogue: Array<{ kind: AzureResourceKind; aliases: string[]; cols: { name: string[]; sku?: string[]; sizeGB?: string[]; createdTime?: string[]; extras: string[] } }> = [
+    { kind: 'disk',            aliases: ['Disks', 'Managed Disks', 'Disk'],
+      cols: { name: ['Disk Name', 'Name'], sku: ['SKU'], sizeGB: ['Disk Size'], createdTime: ['Created Time'], extras: ['Disk State', 'Encryption', 'OS Type', 'Disk IOPS Read / Write'] } },
+    { kind: 'keyVault',        aliases: ['Key Vaults', 'KeyVault', 'Key Vault'],
+      cols: { name: ['Name'], sku: ['SKU', 'SKU Family'], extras: ['Vault Uri', 'Public Network Access', 'Enable RBAC', 'Enable Soft Delete'] } },
+    { kind: 'sqlDb',           aliases: ['SQL DBs', 'SQL Databases', 'Sql Databases', 'SQL DB'],
+      cols: { name: ['Name'], sku: ['Service Tier', 'Hardware Configuration'], extras: ['Database Server', 'Status', 'DTU Capacity', 'Data Max Size (GB)', 'Zone Redundant'] } },
+    { kind: 'sqlServer',       aliases: ['SQL Servers', 'Sql Servers', 'SQL Server'],
+      cols: { name: ['Name'], sku: ['Kind', 'Version'], extras: ['Admin Login', 'FQDN', 'Public Network Access', 'State'] } },
+    { kind: 'sqlVm',           aliases: ['SQL VMs', 'Sql VMs', 'SQL VM'],
+      cols: { name: ['Name'], sku: ['SQL Image Sku', 'SQL Image'], extras: ['SQL Server License Type', 'SQL Management'] } },
+    { kind: 'recoveryVault',   aliases: ['Recovery Vaults', 'Recovery Services Vaults', 'Recovery Vault'],
+      cols: { name: ['Name'], sku: ['SKU Name'], extras: ['Private Endpoint State for Backup', 'Private Endpoint State for Site Recovery'] } },
+    { kind: 'appGateway',      aliases: ['App Gateway', 'Application Gateway', 'App Gateways', 'Application Gateways'],
+      cols: { name: ['Name'], sku: ['SKU Name'], extras: ['State', 'WAF Enabled', 'Minimum TLS Version', 'Backend', 'Frontend'] } },
+    { kind: 'privateEndpoint', aliases: ['Private Endpoint', 'Private Endpoints'],
+      cols: { name: ['Name'], extras: ['VNET', 'Subnet', 'Private Link Name', 'IP Address', 'FQDN', 'Private Link Status', 'Private Link Resource Type'] } },
+    { kind: 'logAnalytics',    aliases: ['Workspaces', 'Log Analytics', 'Log Analytics Workspaces', 'Workspace'],
+      cols: { name: ['Name'], sku: ['SKU'], createdTime: ['Created Time'], extras: ['Retention Days', 'Daily Cap (GB)'] } },
+    { kind: 'availabilitySet', aliases: ['Availability Sets', 'AvailabilitySets', 'Availability Set'],
+      cols: { name: ['Name'], extras: ['Fault Domains', 'Update Domains', 'Virtual Machines', 'Orphaned'] } },
+    { kind: 'routeTable',      aliases: ['Route Tables', 'RouteTables', 'Route Table'],
+      cols: { name: ['Name'], extras: ['Disable BGP Route Propagation', 'Routes', 'Routes Prefixes', 'Routes Next Hop Type', 'Orphaned'] } },
+    { kind: 'managedIdentity', aliases: ['Managed Identity', 'Managed Identities', 'User Assigned Managed Identities'],
+      cols: { name: ['Name'], extras: ['Principal ID', 'Client ID'] } },
+    { kind: 'bastion',         aliases: ['Bastion', 'Bastions', 'Bastion Host'],
+      cols: { name: ['Name'], sku: ['SKU'], extras: [] } },
+    { kind: 'acr',             aliases: ['Container Registries', 'ACR', 'Container Registry'],
+      cols: { name: ['Name'], sku: ['SKU'], extras: ['Admin User Enabled', 'Login Server'] } },
+    { kind: 'aks',             aliases: ['AKS', 'Kubernetes', 'Azure Kubernetes Service', 'Container Apps'],
+      cols: { name: ['Name'], sku: ['SKU', 'Tier'], extras: ['Kubernetes Version', 'Node Count'] } },
+    { kind: 'appService',      aliases: ['App Services', 'App Service Plans', 'Web Apps'],
+      cols: { name: ['Name'], sku: ['SKU', 'Tier'], extras: ['Number of Sites'] } },
+    { kind: 'functionApp',     aliases: ['Function Apps', 'Functions'],
+      cols: { name: ['Name'], sku: ['SKU'], extras: ['Hosting Plan'] } },
+  ];
+  const sheetCatalogueResolved = sheetCatalogue.map(c => ({
+    ...c,
+    sheet: findSheet(wb, c.aliases),
+  }));
+
+  const otherDetection: Record<string, boolean> = {};
+  for (const c of sheetCatalogueResolved) otherDetection[c.kind] = Boolean(c.sheet);
 
   const detection = {
     vm:        Boolean(vmSheet),
@@ -97,9 +141,15 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
     nsg:       Boolean(nsgSheet),
     publicIp:  Boolean(pipSheet),
     storage:   Boolean(storageSheet),
+    others:    otherDetection,
   };
 
+  const otherDetectionStr = sheetCatalogueResolved
+    .filter(c => c.sheet)
+    .map(c => `${c.kind}:${c.sheet}`)
+    .join('  ');
   log(`Detected sheets — VM:${vmSheet ?? '—'}  VNET:${vnetSheet ?? '—'}  Subnet:${subnetSheet ?? '—'}  NIC:${nicSheet ?? '—'}  Peer:${peerSheet ?? '—'}  NSG:${nsgSheet ?? '—'}  PIP:${pipSheet ?? '—'}  Storage:${storageSheet ?? '—'}`);
+  if (otherDetectionStr) log(`Catalogue extras — ${otherDetectionStr}`);
 
   const vmRows      = readSheet(wb, vmSheet);
   const vnetRows    = readSheet(wb, vnetSheet);
@@ -344,6 +394,37 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   if (orphanCount > 0) notes.push(`${orphanCount} VM(s) could not be linked to a subnet — placed in an "unattached" pad.`);
   if (!detection.nic) notes.push(`No NIC sheet found — VM/subnet links inferred from the VM sheet.`);
 
+  // ---- Phase 2: Other catalogue resources (driven by sheetCatalogueResolved) ----
+  const others: OtherResource[] = [];
+  for (const cat of sheetCatalogueResolved) {
+    if (!cat.sheet) continue;
+    const rows = readSheet(wb, cat.sheet);
+    for (const r of rows) {
+      const name = pick(r, cat.cols.name);
+      if (!name) continue;
+      const sku = cat.cols.sku ? pick(r, cat.cols.sku) : '';
+      const sizeRaw = cat.cols.sizeGB ? num(pick(r, cat.cols.sizeGB)) : NaN;
+      const createdTime = cat.cols.createdTime ? pick(r, cat.cols.createdTime) : '';
+      const extras: Record<string, string> = {};
+      for (const c of cat.cols.extras) {
+        const v = pick(r, [c]);
+        if (v) extras[c] = v;
+      }
+      others.push({
+        id: norm(`${cat.kind}::${name}`),
+        kind: cat.kind,
+        name,
+        rg: pick(r, ['Resource Group', 'ResourceGroup', 'RG']),
+        subscription: pick(r, ['Subscription', 'Subscription Name']),
+        location: pick(r, ['Location', 'Region']),
+        sku: sku || undefined,
+        sizeGB: Number.isFinite(sizeRaw) ? sizeRaw : undefined,
+        createdTime: createdTime || undefined,
+        extras,
+      });
+    }
+  }
+
   // ---- Derive hierarchy: Region -> Subscription -> ResourceGroup --------
   // Every parsed resource carries a (subscription, location, rg) triple. Roll
   // them up into the four-level estate model the SimCity 3000 layout consumes.
@@ -353,6 +434,7 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   for (const s of storage)    bucket.push({ type: 'storage',   sub: '',             loc: s.location, rg: s.rg });
   for (const n of nsgs)       bucket.push({ type: 'nsg',       sub: '',             loc: n.location, rg: n.rg });
   for (const p of publicIps)  bucket.push({ type: 'publicIp',  sub: '',             loc: p.location, rg: p.rg });
+  for (const o of others)     bucket.push({ type: o.kind,      sub: o.subscription, loc: o.location, rg: o.rg });
   // Storage/NSG/PIP rows lack subscription in some ARI exports — propagate the
   // VM subscription if they share an RG. This keeps single-sub estates (the
   // common case) coherent.
@@ -416,7 +498,13 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   const subsArr = [...subMap.values()];
   const rgsArr = [...rgMap.values()];
 
+  // Per-kind summary for "others"
+  const otherCounts = new Map<string, number>();
+  for (const o of others) otherCounts.set(o.kind, (otherCounts.get(o.kind) ?? 0) + 1);
+  const othersSummary = [...otherCounts.entries()].map(([k, c]) => `${c} ${k}`).join(' · ');
+
   log(`Parsed: ${vms.length} VMs · ${vnets.length} VNets · ${subnets.length} subnets · ${peerings.length} peerings · ${nsgs.length} NSGs · ${publicIps.length} PIPs · ${storage.length} storage`);
+  if (othersSummary) log(`Catalogue extras parsed: ${othersSummary}`);
   log(`Hierarchy: ${regionsArr.length} regions · ${subsArr.length} subscriptions · ${rgsArr.length} resource groups`);
   if (notes.length) for (const n of notes) log(`  · ${n}`);
 
@@ -424,7 +512,7 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
     regions: regionsArr,
     subscriptions: subsArr,
     resourceGroups: rgsArr,
-    vms, vnets, subnets, peerings, nsgs, publicIps, storage,
+    vms, vnets, subnets, peerings, nsgs, publicIps, storage, others,
     vmsBySubnet, subnetsByVnet, detection, notes,
   };
 }

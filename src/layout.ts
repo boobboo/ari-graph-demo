@@ -19,7 +19,7 @@ import type {
   Vm, Vnet, Subnet, Peering,
   PlacedRegion, PlacedSubscription, PlacedResourceGroup,
   PlacedVm, PlacedSubnet, PlacedVnet,
-  PlacedNic, PlacedNsg, PlacedPublicIp, PlacedStorage,
+  PlacedNic, PlacedNsg, PlacedPublicIp, PlacedStorage, PlacedOther,
 } from './types';
 import { lookup as lookupCatalogue, ZONE_TINT } from './catalogue';
 
@@ -74,7 +74,7 @@ const rgIdOf = (sub: string, rg: string) => norm(`${sub || '(no subscription)'}:
 
 // ---- Pass 4: building tiles inside one RG -----------------------------
 interface Building {
-  refType: 'vm' | 'storage' | 'nsg' | 'publicIp';
+  refType: string;               // catalogue key: 'vm' | 'storage' | 'nsg' | 'publicIp' | 'keyVault' | ...
   refId: string;
   footprint: number;             // 1..4 from catalogue
   storeys: number;
@@ -91,7 +91,7 @@ const ZONE_ORDER: Record<string, number> = {
   'Civic':   9, 'Utility':  10,
 };
 
-function buildingFor(refType: Building['refType'], r: { sku?: string; vCPU?: number; ramGB?: number; kind?: string; tier?: 'hot'|'cool'|'archive'|'unknown' }): Omit<Building, 'refId'> | null {
+function buildingFor(refType: string, r: { sku?: string; vCPU?: number; ramGB?: number; kind?: string; tier?: 'hot'|'cool'|'archive'|'unknown' }): Omit<Building, 'refId'> | null {
   const entry = lookupCatalogue(refType);
   if (!entry) return null;
   return {
@@ -197,6 +197,17 @@ export function buildWorld(graph: Graph): World {
     if (!proto) continue;
     pushBuilding('', p.rg, { ...proto, refId: p.id });
   }
+  // Phase 2: every Other resource gets a building too, looked up by its kind.
+  for (const o of graph.others) {
+    // Skip kinds we explicitly don't draw (purely metadata):
+    // - managedIdentity (intangible identity badge)
+    // - availabilitySet (org grouping; future: render as a fence around member VMs)
+    // - routeTable (per-RG, too many; future: as a road sign at the gate)
+    if (o.kind === 'managedIdentity' || o.kind === 'availabilitySet' || o.kind === 'routeTable') continue;
+    const proto = buildingFor(o.kind, { sku: o.sku });
+    if (!proto) continue;
+    pushBuilding(o.subscription, o.rg, { ...proto, refId: o.id });
+  }
   // Resources with no subscription resolve to whatever subscription their RG
   // ended up in (parser already propagates subscription per RG when possible).
   // Re-key buckets that landed under "(no subscription)" but now belong to a
@@ -219,8 +230,10 @@ export function buildWorld(graph: Graph): World {
     rgPlacements.set(rg.id, placeBuildings(reKeyed.get(rg.id) ?? []));
   }
 
-  // ---- Pass 3: RGs within their Subscription ----------------------------
-  interface SubPlacement { width: number; depth: number; rgs: Array<{ rgId: string; cx: number; cz: number }>; }
+  // ---- Pass 3: Squarified treemap of RGs inside each Subscription ------
+  // Per PRD §6: districts inside a city laid out as a squarified treemap so
+  // RGs of very different sizes still tile cleanly with low aspect-ratio.
+  interface SubPlacement { width: number; depth: number; rgs: Array<{ rgId: string; cx: number; cz: number; w: number; d: number }>; }
   const subPlacements = new Map<string, SubPlacement>();
   for (const sub of graph.subscriptions) {
     const rgs = sub.rgIds.map(id => graph.resourceGroups.find(r => r.id === id)).filter((x): x is NonNullable<typeof x> => Boolean(x));
@@ -228,29 +241,24 @@ export function buildWorld(graph: Graph): World {
       subPlacements.set(sub.id, { width: TILE * 4, depth: TILE * 4, rgs: [] });
       continue;
     }
-    // Simple grid layout; cell size = max RG dimension to keep things rectilinear.
-    const maxW = Math.max(...rgs.map(r => rgPlacements.get(r.id)?.width ?? TILE * 2));
-    const maxD = Math.max(...rgs.map(r => rgPlacements.get(r.id)?.depth ?? TILE * 2));
-    const cellW = maxW + RG_GAP;
-    const cellD = maxD + RG_GAP;
-    const cols = gridSide(rgs.length);
-    const rows = Math.ceil(rgs.length / cols);
-    const innerW = cols * cellW - RG_GAP;
-    const innerD = rows * cellD - RG_GAP;
-    const originX = -innerW / 2 + maxW / 2;
-    const originZ = -innerD / 2 + maxD / 2;
-    const placed: Array<{ rgId: string; cx: number; cz: number }> = [];
-    rgs.forEach((rg, i) => {
-      const c = i % cols, r = Math.floor(i / cols);
-      placed.push({
-        rgId: rg.id,
-        cx: originX + c * cellW,
-        cz: originZ + r * cellD,
-      });
+    // Each RG's natural size from Pass 4. We treat its area as the treemap
+    // weight, then squarify into a bounding box whose total area matches the
+    // sum (plus padding for kerbs).
+    const items = rgs.map(rg => {
+      const p = rgPlacements.get(rg.id) ?? { width: TILE * 2, depth: TILE * 2, slots: new Map() };
+      return { rgId: rg.id, w: p.width, d: p.depth, area: p.width * p.depth };
     });
+    const totalArea = items.reduce((s, it) => s + it.area, 0);
+    // Choose an aspect ratio close to 1 by deriving the bounding box dim.
+    const sideLen = Math.sqrt(totalArea) * 1.18 + RG_GAP * Math.sqrt(items.length);
+    const placed = squarifiedTreemap(items, sideLen, sideLen);
+    const usedW = placed.reduce((m, p) => Math.max(m, p.cx + p.w / 2), -Infinity) -
+                  placed.reduce((m, p) => Math.min(m, p.cx - p.w / 2),  Infinity);
+    const usedD = placed.reduce((m, p) => Math.max(m, p.cz + p.d / 2), -Infinity) -
+                  placed.reduce((m, p) => Math.min(m, p.cz - p.d / 2),  Infinity);
     subPlacements.set(sub.id, {
-      width: innerW + SUB_PADDING * 2,
-      depth: innerD + SUB_PADDING * 2,
+      width: usedW + SUB_PADDING * 2,
+      depth: usedD + SUB_PADDING * 2,
       rgs: placed,
     });
   }
@@ -372,6 +380,23 @@ export function buildWorld(graph: Graph): World {
       rgId: slot.rgId,
       zone: entry.zone,
       building: entry.building,
+      footprint: slot.footprint,
+    });
+  }
+
+  const placedOthers: PlacedOther[] = [];
+  for (const o of graph.others) {
+    const slot = buildingPos.get(o.id);
+    if (!slot) continue;
+    const entry = lookupCatalogue(o.kind);
+    if (!entry) continue;
+    placedOthers.push({
+      ...o,
+      pos: [slot.x, slot.z],
+      rgId: slot.rgId,
+      zone: entry.zone,
+      building: entry.building,
+      storeys: entry.storeysFor({ sku: o.sku }),
       footprint: slot.footprint,
     });
   }
@@ -520,6 +545,7 @@ export function buildWorld(graph: Graph): World {
     storage: placedStorage,
     nsgs: placedNsgs,
     publicIps: placedPublicIps,
+    others: placedOthers,
     subnets: placedSubnets,
     vnets: placedVnets,
     peerings: graph.peerings,
@@ -529,6 +555,76 @@ export function buildWorld(graph: Graph): World {
     subnetById,
     rgById,
   };
+}
+
+// ---- Squarified treemap (PRD §6) ---------------------------------------
+// Bruls/Huijbregts/van Wijk (2000) — squarify items into rectangles of
+// minimal aspect ratio inside a bounding box. We pre-sort by area desc.
+//
+// Returns one rect per input { cx, cz, w, d }; cx/cz centred relative to
+// the bounding-box origin (0,0) so the caller can offset to subscription centre.
+interface TmItem { rgId: string; area: number; w: number; d: number; }
+function squarifiedTreemap(
+  items: TmItem[], boxW: number, boxD: number,
+): Array<{ rgId: string; cx: number; cz: number; w: number; d: number }> {
+  if (items.length === 0) return [];
+  const totalArea = items.reduce((s, it) => s + it.area, 0);
+  const scale = (boxW * boxD) / Math.max(totalArea, 1e-6);
+  const scaled = items.map(it => ({ ...it, area: it.area * scale }))
+    .sort((a, b) => b.area - a.area);
+  const out: Array<{ rgId: string; cx: number; cz: number; w: number; d: number }> = [];
+
+  let x = 0, y = 0, remW = boxW, remD = boxD;
+  let row: Array<TmItem & { area: number }> = [];
+
+  const worst = (rowItems: typeof row, shortSide: number) => {
+    if (rowItems.length === 0) return Infinity;
+    const sumA = rowItems.reduce((s, r) => s + r.area, 0);
+    const maxA = Math.max(...rowItems.map(r => r.area));
+    const minA = Math.min(...rowItems.map(r => r.area));
+    const s2 = shortSide * shortSide;
+    return Math.max((s2 * maxA) / (sumA * sumA), (sumA * sumA) / (s2 * minA));
+  };
+
+  const layoutRow = (rowItems: typeof row, horizontal: boolean) => {
+    const sumA = rowItems.reduce((s, r) => s + r.area, 0);
+    if (horizontal) {
+      // Lay along width (rowH = sumA / remW)
+      const rowH = sumA / remW;
+      let cx = x;
+      for (const it of rowItems) {
+        const w = it.area / rowH;
+        out.push({ rgId: it.rgId, cx: cx + w / 2 - boxW / 2, cz: y + rowH / 2 - boxD / 2, w, d: rowH });
+        cx += w;
+      }
+      y += rowH;
+      remD -= rowH;
+    } else {
+      const rowW = sumA / remD;
+      let cz = y;
+      for (const it of rowItems) {
+        const d = it.area / rowW;
+        out.push({ rgId: it.rgId, cx: x + rowW / 2 - boxW / 2, cz: cz + d / 2 - boxD / 2, w: rowW, d });
+        cz += d;
+      }
+      x += rowW;
+      remW -= rowW;
+    }
+  };
+
+  for (const it of scaled) {
+    const horizontal = remW <= remD;
+    const shortSide = Math.min(remW, remD);
+    const candidate = [...row, it];
+    if (worst(candidate, shortSide) <= worst(row, shortSide)) {
+      row.push(it);
+    } else {
+      layoutRow(row, horizontal);
+      row = [it];
+    }
+  }
+  if (row.length > 0) layoutRow(row, remW <= remD);
+  return out;
 }
 
 // Re-export the zone tint table so world.ts can use the same source-of-truth.

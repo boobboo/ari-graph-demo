@@ -66,6 +66,33 @@ export interface StorageAccount {
   tier: StorageTier;
 }
 
+/** Catalogue type discriminator. Any value lookup-able in CATALOGUE. */
+export type AzureResourceKind =
+  | 'vm' | 'storage' | 'nsg' | 'publicIp'
+  | 'disk' | 'keyVault' | 'sqlDb' | 'sqlServer' | 'sqlVm'
+  | 'recoveryVault' | 'appGateway' | 'privateEndpoint'
+  | 'logAnalytics' | 'availabilitySet' | 'routeTable' | 'managedIdentity'
+  | 'appService' | 'functionApp' | 'logicApp' | 'serviceBus'
+  | 'aks' | 'vmss' | 'databricks' | 'apim' | 'defender' | 'acr' | 'bastion';
+
+/**
+ * Catch-all parser output for resources that don't need a bespoke interface
+ * (most types beyond VM/Storage/NSG/PublicIP). Carries enough to drive the
+ * catalogue archetype, plus a freeform `extras` map for tooltips.
+ */
+export interface OtherResource {
+  id: string;
+  kind: AzureResourceKind;
+  name: string;
+  rg: string;
+  subscription: string;
+  location: string;
+  sku?: string;
+  sizeGB?: number;
+  createdTime?: string;
+  extras: Record<string, string>;
+}
+
 export interface Graph {
   // Hierarchy (derived in parser from resource location/subscription/RG)
   regions: Region[];
@@ -80,12 +107,16 @@ export interface Graph {
   nsgs: Nsg[];
   publicIps: PublicIp[];
   storage: StorageAccount[];
+  /** Catch-all for catalogue resources that don't get bespoke interfaces. */
+  others: OtherResource[];
 
   vmsBySubnet: Map<string, Vm[]>;
   subnetsByVnet: Map<string, Subnet[]>;
   detection: {
     vm: boolean; vnet: boolean; subnet: boolean; nic: boolean; peering: boolean;
     nsg: boolean; publicIp: boolean; storage: boolean;
+    /** Per-kind detection flags for "other" sheets. */
+    others: Record<string, boolean>;
   };
   notes: string[];
 }
@@ -198,6 +229,16 @@ export interface PlacedStorage extends StorageAccount {
   footprint: number;
 }
 
+/** A placed catalogue building for any "Other" resource kind. */
+export interface PlacedOther extends OtherResource {
+  pos: [number, number];
+  rgId: string;
+  zone: string;
+  building: string;          // archetype from catalogue
+  storeys: number;
+  footprint: number;
+}
+
 export interface World {
   // Hierarchy (PRD §5.1)
   regions: PlacedRegion[];
@@ -209,6 +250,8 @@ export interface World {
   storage: PlacedStorage[];
   nsgs: PlacedNsg[];
   publicIps: PlacedPublicIp[];
+  /** All "other" catalogue buildings (Key Vaults, SQL DBs, App Gateway, …) */
+  others: PlacedOther[];
 
   // Network overlay — derived in layout, drawn as roads/markers in world.
   subnets: PlacedSubnet[];

@@ -11,7 +11,7 @@
 
 import * as THREE from 'three';
 import type {
-  World, PlacedVm, PlacedNsg, PlacedPublicIp, PlacedStorage,
+  World, PlacedVm, PlacedNsg, PlacedPublicIp, PlacedStorage, PlacedOther,
   PlacedRegion, PlacedSubscription, PlacedResourceGroup,
 } from './types';
 import { ZONE_TINT } from './catalogue';
@@ -85,7 +85,8 @@ export interface BuiltScene {
 export type ServiceTip =
   | { kind: 'nsg'; data: PlacedNsg }
   | { kind: 'publicIp'; data: PlacedPublicIp }
-  | { kind: 'storage'; data: PlacedStorage };
+  | { kind: 'storage'; data: PlacedStorage }
+  | { kind: 'other'; data: PlacedOther };
 
 export function buildScene(world: World): BuiltScene {
   const scene = new THREE.Scene();
@@ -360,6 +361,17 @@ export function buildScene(world: World): BuiltScene {
     disposables.push(flagGeom, flagMat);
   }
 
+  // ---- Other catalogue buildings (Phase 2) ---------------------------
+  // One archetype renderer per building class; everything stays simple
+  // proceedural geometry with consistent palette so the city reads coherently.
+  for (const o of world.others) {
+    const handle = renderArchetype(scene, o, buildingBaseY, disposables);
+    if (handle) {
+      serviceTargets.push(handle);
+      serviceLookup.set(handle, { kind: 'other', data: o });
+    }
+  }
+
   // ---- VNet avenues + Subnet street markers ---------------------------
   // VNet = polyline avenue threading through its subnet centroids. Subnets
   // with no member buildings are skipped (their centroid is at world origin).
@@ -588,6 +600,300 @@ function addBridgeBox(
   scene.add(mesh);
   disposables.push(geom, mat);
   void ROAD_COLOR; // reserved for in-RG service roads (next pass)
+}
+
+// ---- Archetype renderer (PRD §5.2 + §5.6 stage progression) -----------
+// One geometry per catalogue building archetype. Stage tier (from SKU)
+// modulates storey count via the catalogue, and biases roof / accent tones
+// here so e.g. a Premium building reads richer than a Basic one.
+function renderArchetype(
+  scene: THREE.Scene,
+  o: PlacedOther,
+  baseY: number,
+  disposables: Array<{ dispose(): void }>,
+): THREE.Object3D | null {
+  const fp = FOOTPRINT_TILE * o.footprint;
+  const totalH = Math.max(0.6, o.storeys * STOREY_H);
+  const stageBoost = stageHint(o.sku);    // 0..1 — Premium/Standard cladding tint
+
+  switch (o.building) {
+    case 'police_hq': {
+      // Compact civic block: blue body, light roof, visible badge (cone).
+      const bodyGeom = new THREE.BoxGeometry(fp, totalH, fp);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0x355bb5, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + totalH / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      // Star/badge on the roof.
+      const badgeGeom = new THREE.ConeGeometry(0.32, 0.4, 5);
+      const badgeMat = new THREE.MeshLambertMaterial({ color: 0xf2d36b });
+      const badge = new THREE.Mesh(badgeGeom, badgeMat);
+      badge.position.set(o.pos[0], baseY + totalH + 0.2, o.pos[1]);
+      scene.add(badge);
+      disposables.push(badgeGeom, badgeMat);
+      return body;
+    }
+    case 'hospital': {
+      // Stocky civic block with a red cross on the roof.
+      const bodyGeom = new THREE.BoxGeometry(fp, totalH, fp);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0xe6e6e6, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + totalH / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      // Cross.
+      const crossArm = new THREE.BoxGeometry(fp * 0.6, 0.12, 0.18);
+      const crossUp = new THREE.BoxGeometry(0.18, 0.12, fp * 0.6);
+      const crossMat = new THREE.MeshLambertMaterial({ color: 0xc63a3a });
+      const a = new THREE.Mesh(crossArm, crossMat);
+      const b = new THREE.Mesh(crossUp, crossMat);
+      a.position.set(o.pos[0], baseY + totalH + 0.06, o.pos[1]);
+      b.position.set(o.pos[0], baseY + totalH + 0.06, o.pos[1]);
+      scene.add(a); scene.add(b);
+      disposables.push(crossArm, crossUp, crossMat);
+      return body;
+    }
+    case 'fire_station': {
+      const bodyGeom = new THREE.BoxGeometry(fp, totalH, fp);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0xc73d2c, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + totalH / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      return body;
+    }
+    case 'city_hall': {
+      // Mid-height with a stepped tower in the centre and a flat roof skirt.
+      const bodyGeom = new THREE.BoxGeometry(fp, totalH * 0.7, fp);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0xbcbab0, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + (totalH * 0.7) / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      const towerGeom = new THREE.BoxGeometry(fp * 0.45, totalH * 0.6, fp * 0.45);
+      const tower = new THREE.Mesh(towerGeom, bodyMat);
+      tower.position.set(o.pos[0], baseY + totalH * 0.7 + (totalH * 0.6) / 2, o.pos[1]);
+      scene.add(tower);
+      disposables.push(towerGeom);
+      // Dome on top.
+      const domeGeom = new THREE.SphereGeometry(fp * 0.28, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2);
+      const domeMat = new THREE.MeshLambertMaterial({ color: 0xc3a55a });
+      const dome = new THREE.Mesh(domeGeom, domeMat);
+      dome.position.set(o.pos[0], baseY + totalH * 0.7 + totalH * 0.6, o.pos[1]);
+      scene.add(dome);
+      disposables.push(domeGeom, domeMat);
+      return body;
+    }
+    case 'school': {
+      const bodyGeom = new THREE.BoxGeometry(fp, totalH * 0.7, fp);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0xeac07c, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + (totalH * 0.7) / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      // Hipped roof (cone with 4 sides).
+      const roofGeom = new THREE.ConeGeometry(fp * 0.7, totalH * 0.5, 4);
+      roofGeom.rotateY(Math.PI / 4);
+      const roofMat = new THREE.MeshLambertMaterial({ color: 0x8b4f2e });
+      const roof = new THREE.Mesh(roofGeom, roofMat);
+      roof.position.set(o.pos[0], baseY + totalH * 0.7 + (totalH * 0.5) / 2, o.pos[1]);
+      scene.add(roof);
+      disposables.push(roofGeom, roofMat);
+      return body;
+    }
+    case 'university': {
+      // Like school but bigger + multiple wings.
+      const bodyGeom = new THREE.BoxGeometry(fp * 1.05, totalH, fp * 0.55);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0xd1b683, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + totalH / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      const wingGeom = new THREE.BoxGeometry(fp * 0.45, totalH * 0.85, fp);
+      const wing = new THREE.Mesh(wingGeom, bodyMat);
+      wing.position.set(o.pos[0], baseY + (totalH * 0.85) / 2, o.pos[1] + fp * 0.18);
+      scene.add(wing);
+      disposables.push(wingGeom);
+      return body;
+    }
+    case 'customs': {
+      // Border booth: small box with a bar like the NSG checkpoint, but green.
+      const bodyGeom = new THREE.BoxGeometry(fp * 0.85, totalH, fp * 0.85);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0x4a8b6e, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + totalH / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      return body;
+    }
+    case 'reservoir': {
+      // SQL DB / Cosmos: low cylindrical reservoir with a shallow dome.
+      const tankR = fp * 0.45;
+      const tankH = Math.max(0.7, totalH * 0.55);
+      const tankGeom = new THREE.CylinderGeometry(tankR, tankR, tankH, 16);
+      const tankMat = new THREE.MeshLambertMaterial({ color: tintColor(0x7a9bc2, stageBoost) });
+      const tank = new THREE.Mesh(tankGeom, tankMat);
+      tank.position.set(o.pos[0], baseY + tankH / 2, o.pos[1]);
+      scene.add(tank);
+      disposables.push(tankGeom, tankMat);
+      // Lid.
+      const lidGeom = new THREE.SphereGeometry(tankR, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2);
+      const lid = new THREE.Mesh(lidGeom, tankMat);
+      lid.position.set(o.pos[0], baseY + tankH, o.pos[1]);
+      scene.add(lid);
+      disposables.push(lidGeom);
+      return tank;
+    }
+    case 'transit_hub': {
+      // Application Gateway: long building with a curved/sloped roof.
+      const bodyGeom = new THREE.BoxGeometry(fp * 1.1, totalH * 0.6, fp * 0.6);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0xd9d4c2, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + (totalH * 0.6) / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      // Curved canopy approximated with a half-cylinder.
+      const canopyGeom = new THREE.CylinderGeometry(fp * 0.3, fp * 0.3, fp * 1.1, 16, 1, false, 0, Math.PI);
+      const canopyMat = new THREE.MeshLambertMaterial({ color: 0x4a6079 });
+      const canopy = new THREE.Mesh(canopyGeom, canopyMat);
+      canopy.rotation.z = Math.PI / 2;
+      canopy.position.set(o.pos[0], baseY + totalH * 0.6 + fp * 0.15, o.pos[1]);
+      scene.add(canopy);
+      disposables.push(canopyGeom, canopyMat);
+      return body;
+    }
+    case 'market_hall': {
+      // APIM: wide building with a portico of pillars in front.
+      const bodyGeom = new THREE.BoxGeometry(fp, totalH * 0.85, fp * 0.65);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0xd6c19b, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + (totalH * 0.85) / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      const pillarGeom = new THREE.CylinderGeometry(0.1, 0.1, totalH * 0.85, 8);
+      const pillarMat = new THREE.MeshLambertMaterial({ color: 0xefe4c8 });
+      disposables.push(pillarGeom, pillarMat);
+      for (let p = 0; p < 4; p++) {
+        const pillar = new THREE.Mesh(pillarGeom, pillarMat);
+        pillar.position.set(o.pos[0] - fp * 0.4 + p * (fp * 0.27), baseY + (totalH * 0.85) / 2, o.pos[1] + fp * 0.34);
+        scene.add(pillar);
+      }
+      return body;
+    }
+    case 'sorting_office':
+    case 'logistics_centre': {
+      const w = fp * (o.building === 'logistics_centre' ? 1.2 : 1.0);
+      const bodyGeom = new THREE.BoxGeometry(w, totalH * 0.6, fp * 0.7);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0x9eb1bf, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + (totalH * 0.6) / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      // Loading dock: small box on one side.
+      const dockGeom = new THREE.BoxGeometry(w * 0.9, 0.4, 0.4);
+      const dock = new THREE.Mesh(dockGeom, bodyMat);
+      dock.position.set(o.pos[0], baseY + 0.2, o.pos[1] - fp * 0.4);
+      scene.add(dock);
+      disposables.push(dockGeom);
+      return body;
+    }
+    case 'corner_shop':
+    case 'workshop':
+    case 'office_low': {
+      const bodyGeom = new THREE.BoxGeometry(fp * 0.85, totalH, fp * 0.85);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0xc6c4b5, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + totalH / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      // Awning band for the shop variant.
+      if (o.building === 'corner_shop') {
+        const awningGeom = new THREE.BoxGeometry(fp * 0.95, 0.18, 0.5);
+        const awningMat = new THREE.MeshLambertMaterial({ color: 0xe85a3a });
+        const awn = new THREE.Mesh(awningGeom, awningMat);
+        awn.position.set(o.pos[0], baseY + totalH * 0.55, o.pos[1] + fp * 0.45);
+        scene.add(awn);
+        disposables.push(awningGeom, awningMat);
+      }
+      return body;
+    }
+    case 'detached_house':
+    case 'townhouse_row':
+    case 'apartment_block': {
+      const bodyGeom = new THREE.BoxGeometry(fp * 0.85, totalH, fp * 0.85);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0xd6b88a, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + totalH / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      // Pitched roof (smaller & flatter for taller apartment blocks).
+      const roofH = (o.building === 'apartment_block') ? 0.25 : totalH * 0.4;
+      const roofGeom = new THREE.ConeGeometry(fp * 0.55, roofH, 4);
+      roofGeom.rotateY(Math.PI / 4);
+      const roofMat = new THREE.MeshLambertMaterial({ color: 0x8b4f2e });
+      const roof = new THREE.Mesh(roofGeom, roofMat);
+      roof.position.set(o.pos[0], baseY + totalH + roofH / 2, o.pos[1]);
+      scene.add(roof);
+      disposables.push(roofGeom, roofMat);
+      return body;
+    }
+    case 'factory':
+    case 'factory_complex':
+    case 'refinery':
+    case 'steel_mill': {
+      // Heavy industrial: low wide building + tall chimney(s).
+      const bodyGeom = new THREE.BoxGeometry(fp, totalH * 0.6, fp);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: tintColor(0x9d8f7a, stageBoost) });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + (totalH * 0.6) / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      const chimneyCount = (o.building === 'refinery' || o.building === 'steel_mill') ? 3 : 1;
+      const chimneyMat = new THREE.MeshLambertMaterial({ color: 0x6b5b48 });
+      const chimneyGeom = new THREE.CylinderGeometry(0.18, 0.22, totalH * 1.2, 8);
+      disposables.push(chimneyGeom, chimneyMat);
+      for (let i = 0; i < chimneyCount; i++) {
+        const c = new THREE.Mesh(chimneyGeom, chimneyMat);
+        const offset = (i - (chimneyCount - 1) / 2) * (fp * 0.3);
+        c.position.set(o.pos[0] + offset, baseY + totalH * 0.6 + (totalH * 1.2) / 2, o.pos[1]);
+        scene.add(c);
+      }
+      return body;
+    }
+    default: {
+      // Catch-all: simple coloured cube so unmapped archetypes still appear.
+      const bodyGeom = new THREE.BoxGeometry(fp * 0.8, totalH, fp * 0.8);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: 0xb0b0aa });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(o.pos[0], baseY + totalH / 2, o.pos[1]);
+      scene.add(body);
+      disposables.push(bodyGeom, bodyMat);
+      return body;
+    }
+  }
+}
+
+/** Stage hint 0..1 from a SKU string: Basic 0, Standard 0.4, Premium 0.7, Isolated 1. */
+function stageHint(sku?: string): number {
+  if (!sku) return 0.2;
+  const s = sku.toLowerCase();
+  if (s.includes('isolated') || s.startsWith('i')) return 1.0;
+  if (s.includes('premium')  || s.startsWith('p')) return 0.75;
+  if (s.includes('standard') || s.startsWith('s')) return 0.45;
+  if (s.includes('basic')    || s.startsWith('b')) return 0.15;
+  return 0.3;
+}
+
+/** Bias a colour toward white by `amt` (0..1) — used to make Premium tiers read brighter. */
+function tintColor(hex: number, amt: number): number {
+  const r = (hex >> 16) & 0xff;
+  const g = (hex >> 8) & 0xff;
+  const b = hex & 0xff;
+  const lr = Math.min(255, Math.round(r + (255 - r) * amt * 0.45));
+  const lg = Math.min(255, Math.round(g + (255 - g) * amt * 0.45));
+  const lb = Math.min(255, Math.round(b + (255 - b) * amt * 0.45));
+  return (lr << 16) | (lg << 8) | lb;
 }
 
 function addLabelSprite(
