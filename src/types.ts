@@ -152,6 +152,29 @@ export interface ResourceGroup {
   rciPrimary: 'R' | 'C' | 'I' | 'Mixed';
 }
 
+// ---- Numeric carriers (PRD §5.4) --------------------------------------
+// Six scalars carried on every placed building, used to drive the overlay
+// heatmaps. ARI exports surface only a few of these directly (mainly cost
+// can be synthesised from SKU; age can be derived from Created Time when
+// the column is present); the rest are seeded synthetically from a stable
+// id hash so the visualisation behaves like a real-data demo. Comments on
+// each field flag whether it's real-from-ARI or synthetic.
+
+export interface Carriers {
+  /** Monthly cost in GBP. SYNTHETIC — derived from SKU lookup tables. */
+  costMonthlyGbp: number;
+  /** Utilisation % (0..100). SYNTHETIC — id-hash seeded. */
+  utilisationPct: number;
+  /** Age in days. REAL when Created Time present, else SYNTHETIC. */
+  ageDays: number;
+  /** Defender secure-score delta (0..100). SYNTHETIC — id-hash seeded. */
+  defenderDelta: number;
+  /** Unauthorised access attempts (last 30d). SYNTHETIC — id-hash seeded. */
+  unauthAttempts: number;
+  /** Change frequency (events per 30d). SYNTHETIC — id-hash seeded. */
+  changeFreq: number;
+}
+
 // ---- Placed types ------------------------------------------------------
 // Resources are now placed inside their RG. Subnets/VNets are derived from
 // resource positions (computed in layout.ts after Pass 4).
@@ -183,6 +206,7 @@ export interface PlacedVm extends Vm {
   building: string;          // building archetype from catalogue
   storeys: number;           // catalogue-derived storey count
   footprint: number;         // catalogue-derived tile footprint
+  carriers: Carriers;
 }
 
 export interface PlacedSubnet extends Subnet {
@@ -208,25 +232,27 @@ export interface PlacedNic {
 }
 
 export interface PlacedNsg extends Nsg {
-  pos: [number, number];     // ground-plane position
-  facing: [number, number];  // direction the barrier arm sweeps across (perpendicular to the road)
-  // What this NSG is attached to in placed-world coordinates.
+  pos: [number, number];
+  facing: [number, number];
   attachedSubnetId: string | null;
   attachedVmId: string | null;
+  carriers: Carriers;
 }
 
 export interface PlacedPublicIp extends PublicIp {
-  pos: [number, number];     // ground-plane position (next to its NIC shopfront, or at services strip)
+  pos: [number, number];
   attachedVmId: string | null;
+  carriers: Carriers;
 }
 
 export interface PlacedStorage extends StorageAccount {
-  pos: [number, number];     // ground-plane position inside its RG district
+  pos: [number, number];
   storeys: number;
   rgId: string;
   zone: string;
   building: string;
   footprint: number;
+  carriers: Carriers;
 }
 
 /** A placed catalogue building for any "Other" resource kind. */
@@ -234,9 +260,12 @@ export interface PlacedOther extends OtherResource {
   pos: [number, number];
   rgId: string;
   zone: string;
-  building: string;          // archetype from catalogue
+  building: string;
   storeys: number;
   footprint: number;
+  carriers: Carriers;
+  /** Coverage-radius emitter? (Key Vault / Recovery Vault / Defender / Log Analytics) */
+  emitsCoverage?: { radius: number; service: 'secrets' | 'backup' | 'security' | 'monitoring' };
 }
 
 export interface World {

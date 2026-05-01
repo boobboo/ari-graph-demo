@@ -33,6 +33,29 @@ export function showLanding(show: boolean) {
   landing.style.display = show ? 'flex' : 'none';
   document.getElementById('legend')!.style.display = show ? 'none' : 'block';
   document.getElementById('reset')!.style.display = show ? 'none' : 'inline-block';
+  document.getElementById('overlay-panel')!.style.display = show ? 'none' : 'block';
+  document.getElementById('demand-graph')!.style.display = show ? 'none' : 'block';
+  document.getElementById('news-ticker')!.style.display = show ? 'none' : 'block';
+}
+
+export function renderDemandGraph(rg: { R: number; C: number; I: number }) {
+  const bars = document.getElementById('demand-bars')!;
+  const fmt = (v: number) => `${Math.round(v * 100)}%`;
+  const row = (label: string, value: number, color: string) => `
+    <div class="demand-bar-row">
+      <span class="label">${label}</span>
+      <span class="bar"><span class="fill" style="width:${value * 100}%;background:${color}"></span></span>
+      <span class="pct">${fmt(value)}</span>
+    </div>`;
+  bars.innerHTML =
+    row('Residential', rg.R, '#a6c97a') +
+    row('Commercial',  rg.C, '#7aa9bf') +
+    row('Industrial',  rg.I, '#c89556');
+}
+
+export function setNewsTicker(line: string) {
+  const el = document.getElementById('news-ticker')!;
+  el.innerHTML = line;
 }
 
 export function setLockPrompt(show: boolean) {

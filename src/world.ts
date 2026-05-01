@@ -71,6 +71,10 @@ const TOLL_BOOTH_ROOF = 0xb6852c;
 const FLAG_STANDARD = 0x4ec27d;
 const FLAG_BASIC = 0x9aa29a;
 
+export type OverlayMode =
+  | 'off' | 'cost' | 'traffic' | 'pollution' | 'crime'
+  | 'landValue' | 'age' | 'drift' | 'coverage';
+
 export interface BuiltScene {
   scene: THREE.Scene;
   vmTowers: THREE.InstancedMesh[];
@@ -79,6 +83,12 @@ export interface BuiltScene {
   serviceTargets: THREE.Object3D[];
   serviceLookup: Map<THREE.Object3D, ServiceTip>;
   spawn: { pos: THREE.Vector3; lookAt: THREE.Vector3 };
+  /** Toggle which overlay heatmap is visible. 'off' hides them all. */
+  setOverlay(mode: OverlayMode): void;
+  /** RGs (for the camera-frame helper). */
+  rgs: PlacedResourceGroup[];
+  /** World bounds (for the iso camera framing). */
+  bounds: { min: [number, number]; max: [number, number] };
   dispose(): void;
 }
 
@@ -388,6 +398,88 @@ export function buildScene(world: World): BuiltScene {
     addBridgeBox(scene, a.center, b.center, REGION_FLOOR_H + 0.15, 1.6, 0.4, 0x3a3835, disposables);
   }
 
+  // ---- Coverage radii (PRD §5.6, the "killer mapping") ---------------
+  // Each civic emitter (Key Vault, Recovery Vault, Defender, Log Analytics)
+  // radiates a coloured disc on the ground. Buildings outside the union of
+  // discs that should serve them get an "underserved" red highlight when
+  // the coverage overlay is active.
+  const coverageDiscs = new THREE.Group();
+  coverageDiscs.visible = false;
+  for (const o of world.others) {
+    if (!o.emitsCoverage) continue;
+    const colour = COVERAGE_COLOURS[o.emitsCoverage.service];
+    const geom = new THREE.RingGeometry(0, o.emitsCoverage.radius, 48, 1);
+    const mat = new THREE.MeshBasicMaterial({
+      color: colour, transparent: true, opacity: 0.18,
+      side: THREE.DoubleSide, depthWrite: false,
+    });
+    const ring = new THREE.Mesh(geom, mat);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(o.pos[0], buildingBaseY + 0.04, o.pos[1]);
+    coverageDiscs.add(ring);
+    disposables.push(geom, mat);
+  }
+  scene.add(coverageDiscs);
+
+  // ---- Underserved-resource markers (the negative-space view) ---------
+  // For each VM, compute distance to nearest emitter of each service.
+  // If any required service has no emitter within range, mark the VM with
+  // a small red flag. Visible only when coverage overlay is on.
+  const underservedMarkers = new THREE.Group();
+  underservedMarkers.visible = false;
+  const requiredServices: Array<'secrets' | 'backup' | 'security' | 'monitoring'> =
+    ['backup', 'security', 'monitoring'];   // PRD: "every workload needs these"
+  const flagGeom = new THREE.ConeGeometry(0.4, 1.6, 5);
+  const flagMat = new THREE.MeshBasicMaterial({ color: 0xc63a3a, transparent: true, opacity: 0.85 });
+  disposables.push(flagGeom, flagMat);
+  for (const v of world.vms) {
+    let underserved = false;
+    for (const svc of requiredServices) {
+      let covered = false;
+      for (const o of world.others) {
+        if (!o.emitsCoverage || o.emitsCoverage.service !== svc) continue;
+        const dx = o.pos[0] - v.pos[0];
+        const dz = o.pos[1] - v.pos[2];
+        if (Math.hypot(dx, dz) <= o.emitsCoverage.radius) { covered = true; break; }
+      }
+      if (!covered) { underserved = true; break; }
+    }
+    if (underserved) {
+      const flag = new THREE.Mesh(flagGeom, flagMat);
+      const totalH = v.storeys * STOREY_H;
+      flag.position.set(v.pos[0], buildingBaseY + totalH + 1.5, v.pos[2]);
+      underservedMarkers.add(flag);
+    }
+  }
+  scene.add(underservedMarkers);
+
+  // ---- Overlay heatmaps (PRD §5.6) -------------------------------------
+  // Each overlay is a translucent quad over each RG floor whose colour is a
+  // function of the carrier values of its buildings. Toggling switches which
+  // overlay group is visible.
+  const overlayGroups: Record<OverlayMode, THREE.Group> = {
+    off: new THREE.Group(),
+    cost: buildOverlay(world, 'cost', disposables),
+    traffic: buildOverlay(world, 'traffic', disposables),
+    pollution: buildOverlay(world, 'pollution', disposables),
+    crime: buildOverlay(world, 'crime', disposables),
+    landValue: buildOverlay(world, 'landValue', disposables),
+    age: buildOverlay(world, 'age', disposables),
+    drift: buildOverlay(world, 'drift', disposables),
+    coverage: new THREE.Group(),
+  };
+  for (const k of Object.keys(overlayGroups) as OverlayMode[]) {
+    overlayGroups[k].visible = false;
+    if (k !== 'off' && k !== 'coverage') scene.add(overlayGroups[k]);
+  }
+  const setOverlay = (mode: OverlayMode) => {
+    for (const k of Object.keys(overlayGroups) as OverlayMode[]) {
+      overlayGroups[k].visible = (k === mode);
+    }
+    coverageDiscs.visible = (mode === 'coverage');
+    underservedMarkers.visible = (mode === 'coverage');
+  };
+
   // ---- Spawn camera (city-map angle, scaled to estate size) ----------
   const cxc = (world.bounds.min[0] + world.bounds.max[0]) / 2;
   const czc = (world.bounds.min[1] + world.bounds.max[1]) / 2;
@@ -407,6 +499,9 @@ export function buildScene(world: World): BuiltScene {
     serviceTargets,
     serviceLookup,
     spawn: { pos: spawnPos, lookAt: spawnLook },
+    setOverlay,
+    rgs: world.resourceGroups,
+    bounds: world.bounds,
     dispose() {
       for (const d of disposables) d.dispose();
       for (const inst of vmTowers) {
@@ -415,6 +510,112 @@ export function buildScene(world: World): BuiltScene {
       }
     },
   };
+}
+
+// ---- Overlay builder ----------------------------------------------------
+// Compute one carrier value per RG (mean across buildings within), map to a
+// heatmap colour (cool→warm), draw as a translucent quad over the RG floor.
+function buildOverlay(
+  world: World, mode: OverlayMode,
+  disposables: Array<{ dispose(): void }>,
+): THREE.Group {
+  const group = new THREE.Group();
+  if (mode === 'off' || mode === 'coverage') return group;
+
+  // Collect carriers per RG.
+  const buildingsByRg = new Map<string, Array<{ carriers: { costMonthlyGbp: number; utilisationPct: number; ageDays: number; defenderDelta: number; unauthAttempts: number; changeFreq: number; } }>>();
+  const push = (rgId: string, c: any) => {
+    if (!buildingsByRg.has(rgId)) buildingsByRg.set(rgId, []);
+    buildingsByRg.get(rgId)!.push(c);
+  };
+  for (const v of world.vms)        push(v.rgId, v);
+  for (const s of world.storage)    push(s.rgId, s);
+  for (const o of world.others)     push(o.rgId, o);
+  // NSGs/PIPs are part of the same RGs but their carriers also count.
+  for (const n of world.nsgs)       push(/* nsg.rgId not stored — use first matching RG by name */ findRgIdByName(world, n.rg), n);
+  for (const p of world.publicIps)  push(findRgIdByName(world, p.rg), p);
+
+  // Compute per-RG aggregate value.
+  const valueOf = (b: any): number => {
+    switch (mode) {
+      case 'cost':      return b.carriers.costMonthlyGbp;
+      case 'traffic':   return b.carriers.utilisationPct;
+      case 'pollution': return b.carriers.defenderDelta;
+      case 'crime':     return b.carriers.unauthAttempts;
+      case 'landValue': return b.carriers.costMonthlyGbp;     // proxy: cost-per-unit
+      case 'age':       return b.carriers.ageDays;
+      case 'drift':     return b.carriers.changeFreq;
+      default: return 0;
+    }
+  };
+
+  // Find global max for normalisation (pollution etc. are absolute counts).
+  let globalMax = 0;
+  for (const arr of buildingsByRg.values()) for (const b of arr) globalMax = Math.max(globalMax, valueOf(b));
+  if (globalMax === 0) globalMax = 1;
+
+  // Heatmap palette per overlay (PRD §5.6: shared palette family).
+  const palette = OVERLAY_PALETTES[mode] ?? OVERLAY_PALETTES.cost;
+
+  for (const rg of world.resourceGroups) {
+    const arr = buildingsByRg.get(rg.id) ?? [];
+    if (arr.length === 0) continue;
+    const sum = arr.reduce((s, b) => s + valueOf(b), 0);
+    const mean = mode === 'landValue' ? sum / arr.length : sum;   // density vs total
+    const t = Math.min(1, mean / globalMax);
+    const col = lerpPalette(palette, t);
+    const geom = new THREE.PlaneGeometry(rg.width * 0.96, rg.depth * 0.96);
+    const mat = new THREE.MeshBasicMaterial({
+      color: col, transparent: true, opacity: 0.55,
+      side: THREE.DoubleSide, depthWrite: false,
+    });
+    const quad = new THREE.Mesh(geom, mat);
+    quad.rotation.x = -Math.PI / 2;
+    quad.position.set(rg.center[0], REGION_FLOOR_H + RG_FLOOR_H + 0.04, rg.center[1]);
+    group.add(quad);
+    disposables.push(geom, mat);
+  }
+  return group;
+}
+
+function findRgIdByName(world: World, rgName: string): string {
+  // RG id is sub::rg-name; prefer first match by display name.
+  for (const r of world.resourceGroups) if (r.name === rgName) return r.id;
+  return '';
+}
+
+const COVERAGE_COLOURS: Record<string, number> = {
+  secrets:    0x4a90e2,
+  backup:     0xe2a04a,
+  security:   0xe24a6c,
+  monitoring: 0x4ae2a0,
+};
+
+// Colour ramps. Cool → warm for cost/traffic/pollution/crime/age/drift.
+const OVERLAY_PALETTES: Record<OverlayMode, number[]> = {
+  off: [0x000000],
+  cost:      [0x244166, 0x3b7aa6, 0xe9c46a, 0xe76f51, 0x9d2729],
+  traffic:   [0x1f3552, 0x4d8cb8, 0xf7d774, 0xea7a3c, 0xc1303c],
+  pollution: [0xc7e1d4, 0xa8c8ad, 0x96b87d, 0x9e9b58, 0x7d4d3a],
+  crime:     [0x162244, 0x3b3c70, 0x9b3a6f, 0xe24a6c, 0xfff1f0],
+  landValue: [0x2c2c54, 0x474787, 0x9ea7e1, 0xf6c177, 0xeb6f92],
+  age:       [0xfff7e6, 0xf3d9a4, 0xc7965b, 0x8d5524, 0x553311],
+  drift:     [0x2b2d42, 0x556b8d, 0x8d99ae, 0xf7d2c4, 0xff6f59],
+  coverage:  [0x000000],
+};
+
+function lerpPalette(palette: number[], t: number): number {
+  if (palette.length === 1) return palette[0];
+  const idx = t * (palette.length - 1);
+  const i = Math.max(0, Math.min(palette.length - 2, Math.floor(idx)));
+  const f = idx - i;
+  const a = palette[i], b = palette[i + 1];
+  const ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
+  const br = (b >> 16) & 0xff, bg = (b >> 8) & 0xff, bb = b & 0xff;
+  const r = Math.round(ar + (br - ar) * f);
+  const g = Math.round(ag + (bg - ag) * f);
+  const bl = Math.round(ab + (bb - ab) * f);
+  return (r << 16) | (g << 8) | bl;
 }
 
 // ---- Region floor: a flat rectangle at ground level --------------------

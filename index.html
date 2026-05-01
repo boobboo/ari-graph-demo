@@ -105,6 +105,51 @@
         display: none;
       }
       #reset:hover { background: #2a3d52; }
+
+      #overlay-panel {
+        position: fixed; top: 12px; right: 12px; z-index: 5;
+        background: rgba(10,16,22,0.82); backdrop-filter: blur(6px);
+        padding: 10px 12px; border-radius: 8px; font-size: 12px;
+        line-height: 1.4; color: #cfdcec; border: 1px solid #20303f;
+        max-width: 240px; display: none;
+      }
+      .overlay-row { display: flex; gap: 6px; margin: 4px 0; flex-wrap: wrap; }
+      .ovbtn {
+        background: #1a2738; color: #cfdcec; border: 1px solid #2a3d52;
+        padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer;
+        flex: 1; min-width: 0;
+      }
+      .ovbtn:hover { background: #243349; }
+      .ovbtn.active { background: var(--accent); color: #03121f; border-color: var(--accent); }
+      #search { background: #1a2738; color: #cfdcec; border: 1px solid #2a3d52;
+                padding: 4px 8px; border-radius: 4px; font-size: 11px; }
+      #search-results { font-size: 11px; max-height: 140px; overflow-y: auto; margin-top: 4px; }
+      #search-results .hit { padding: 3px 4px; border-radius: 3px; cursor: pointer; }
+      #search-results .hit:hover { background: rgba(102,204,255,0.12); }
+      #search-results .hit b { color: var(--accent); }
+
+      #demand-graph {
+        position: fixed; top: 12px; left: 360px; z-index: 5;
+        background: rgba(10,16,22,0.82); backdrop-filter: blur(6px);
+        padding: 10px 12px; border-radius: 8px; font-size: 11px;
+        color: #cfdcec; border: 1px solid #20303f; min-width: 220px;
+      }
+      #demand-bars { display: flex; flex-direction: column; gap: 4px; }
+      .demand-bar-row { display: flex; align-items: center; gap: 6px; }
+      .demand-bar-row .label { width: 70px; font-size: 11px; }
+      .demand-bar-row .bar { flex: 1; height: 10px; background: #1a2738; border-radius: 2px; overflow: hidden; }
+      .demand-bar-row .fill { height: 100%; }
+      .demand-bar-row .pct { width: 36px; text-align: right; font-variant-numeric: tabular-nums; }
+
+      #news-ticker {
+        position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+        z-index: 5; max-width: 720px; min-width: 360px;
+        background: rgba(10,16,22,0.85); backdrop-filter: blur(6px);
+        padding: 7px 14px; border-radius: 999px; font-size: 12px;
+        color: #cfdcec; border: 1px solid #20303f;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      #news-ticker .src { color: #9fb1c7; }
     </style>
   </head>
   <body>
@@ -129,6 +174,45 @@
       <div class="row"><span class="sw" style="background:#c8c8b8"></span> Mixed</div>
     </div>
     <button id="reset" type="button">Load another file</button>
+
+    <div id="overlay-panel" style="display:none">
+      <div style="font-weight:600; margin-bottom:6px;">Data overlays (PRD §5.6)</div>
+      <div class="overlay-row">
+        <button data-overlay="off" class="ovbtn active">Off</button>
+        <button data-overlay="cost" class="ovbtn">Cost</button>
+        <button data-overlay="traffic" class="ovbtn">Traffic</button>
+        <button data-overlay="pollution" class="ovbtn">Pollution</button>
+      </div>
+      <div class="overlay-row">
+        <button data-overlay="crime" class="ovbtn">Crime</button>
+        <button data-overlay="landValue" class="ovbtn">Land Value</button>
+        <button data-overlay="age" class="ovbtn">Age</button>
+        <button data-overlay="drift" class="ovbtn">Drift</button>
+      </div>
+      <div class="overlay-row">
+        <button data-overlay="coverage" class="ovbtn">Coverage radii</button>
+      </div>
+      <div style="font-weight:600; margin: 10px 0 6px;">Camera</div>
+      <div class="overlay-row">
+        <button id="cam-fly" class="ovbtn active">Fly (perspective)</button>
+        <button id="cam-iso" class="ovbtn">Isometric</button>
+      </div>
+      <div style="font-weight:600; margin: 10px 0 6px;">Find</div>
+      <div class="overlay-row">
+        <input id="search" type="text" placeholder="VM / RG / resource…" style="flex:1; min-width:0;" />
+      </div>
+      <div id="search-results"></div>
+      <div class="overlay-row" style="margin-top:8px">
+        <button id="export-png" class="ovbtn">Export PNG</button>
+      </div>
+    </div>
+
+    <div id="demand-graph" style="display:none">
+      <div style="font-weight:600; margin-bottom:6px;">Estate balance (R/C/I)</div>
+      <div id="demand-bars"></div>
+    </div>
+
+    <div id="news-ticker" style="display:none"></div>
 
     <div id="landing">
       <div id="drop">

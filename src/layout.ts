@@ -22,6 +22,10 @@ import type {
   PlacedNic, PlacedNsg, PlacedPublicIp, PlacedStorage, PlacedOther,
 } from './types';
 import { lookup as lookupCatalogue, ZONE_TINT } from './catalogue';
+import {
+  carriersForVm, carriersForStorage, carriersForNsg, carriersForPublicIp,
+  carriersForOther, coverageFor,
+} from './carriers';
 
 // Tile size in world units. A 1x1 building occupies one tile; a 2x2 occupies
 // four tiles (a 2x2 square). PRD §5.6 fixes footprints at 1, 2, 3, 4.
@@ -364,6 +368,7 @@ export function buildWorld(graph: Graph): World {
       building: entry.building,
       storeys: entry.storeysFor(v),
       footprint: slot.footprint,
+      carriers: carriersForVm(v),
     });
   }
 
@@ -381,6 +386,7 @@ export function buildWorld(graph: Graph): World {
       zone: entry.zone,
       building: entry.building,
       footprint: slot.footprint,
+      carriers: carriersForStorage(s),
     });
   }
 
@@ -398,6 +404,8 @@ export function buildWorld(graph: Graph): World {
       building: entry.building,
       storeys: entry.storeysFor({ sku: o.sku }),
       footprint: slot.footprint,
+      carriers: carriersForOther(o),
+      emitsCoverage: coverageFor(o),
     });
   }
 
@@ -504,6 +512,7 @@ export function buildWorld(graph: Graph): World {
       facing: [fx, fz],
       attachedSubnetId: nsg.subnetId,
       attachedVmId: null,
+      carriers: carriersForNsg(nsg),
     });
   }
 
@@ -523,6 +532,7 @@ export function buildWorld(graph: Graph): World {
       ...pip,
       pos: [slot.x, slot.z],
       attachedVmId,
+      carriers: carriersForPublicIp(pip),
     });
   }
 
