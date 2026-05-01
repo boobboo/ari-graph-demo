@@ -1,9 +1,15 @@
-import type { Graph, World, PlacedVm, PlacedSubnet, PlacedVnet, Subnet, Vm } from './types';
+import type {
+  Graph, World, PlacedVm, PlacedSubnet, PlacedVnet, Subnet, Vm,
+  PlacedNic, PlacedNsg, PlacedPublicIp, PlacedStorage,
+} from './types';
 
-const VM_SPACING = 5;          // grid pitch between houses within a subnet
-const VM_PAD = 3;              // padding around house grid on a subnet plot
+const VM_SPACING = 4;          // grid pitch between tower plots within a subnet
+const VM_PAD = 3;              // padding around the tower grid on a subnet plot
 const SUBNET_GAP = 8;          // gap between subnet plots (room for streets)
-const VNET_GAP = 32;           // gap between hills
+const VNET_GAP = 36;           // gap between districts (room for inter-district roads)
+const STORAGE_PITCH = 7;       // gap between storage car parks in the services strip
+const STORAGE_RG_GAP = 4;      // extra gap between RG groups in the strip
+const STORAGE_OFFSET = 22;     // distance of services strip from the world bounds edge
 const MAX_TOWER = 32;          // tallest VM tower, in blocks
 const MIN_TOWER = 1;
 
@@ -160,11 +166,142 @@ export function buildWorld(graph: Graph): World {
   const vnetById = new Map(placedVnets.map(v => [v.id, v]));
   const subnetById = new Map(placedSubnets.map(s => [s.id, s]));
 
+  // ---- NICs: one shopfront per VM, on the side facing its subnet centre ----
+  // (Multi-NIC support comes via raw graph.vms when each VM may carry several;
+  // today the parser collapses to a single NIC per VM, which is the common case.)
+  const placedNics: PlacedNic[] = [];
+  const vmIdByNicName = new Map<string, string>();
+  for (const vm of placedVms) {
+    if (vm.nicName) vmIdByNicName.set(norm(vm.nicName), vm.id);
+    if (!vm.subnetId) continue;
+    const sub = subnetById.get(vm.subnetId);
+    if (!sub) continue;
+    const dx = sub.center[0] - vm.pos[0];
+    const dz = sub.center[1] - vm.pos[2];
+    const len = Math.hypot(dx, dz) || 1;
+    const fx = dx / len, fz = dz / len;
+    placedNics.push({
+      vmId: vm.id,
+      subnetId: vm.subnetId,
+      privateIp: vm.privateIp ?? '',
+      pos: [vm.pos[0] + fx * (VM_SPACING * 0.32), vm.pos[2] + fz * (VM_SPACING * 0.32)],
+      facing: [fx, fz],
+    });
+  }
+  const nicByVmId = new Map(placedNics.map(n => [n.vmId, n]));
+
+  // ---- NSGs: subnet-attached at the subnet "gate"; NIC-attached next to the VM ----
+  const placedNsgs: PlacedNsg[] = [];
+  for (const nsg of graph.nsgs) {
+    if (nsg.subnetId) {
+      const sub = subnetById.get(nsg.subnetId);
+      if (!sub) continue;
+      // Gate edge = the side of the subnet facing the VNet centre.
+      const dx = sub.vnetCenter[0] - sub.center[0];
+      const dz = sub.vnetCenter[1] - sub.center[1];
+      const len = Math.hypot(dx, dz) || 1;
+      const fx = dx / len, fz = dz / len;
+      const edgeOffset = sub.size / 2 + 1.5;
+      placedNsgs.push({
+        ...nsg,
+        pos: [sub.center[0] + fx * edgeOffset, sub.center[1] + fz * edgeOffset],
+        facing: [-fz, fx],     // perpendicular to the road direction (the barrier sweep)
+        attachedSubnetId: nsg.subnetId,
+        attachedVmId: null,
+      });
+    } else if (nsg.nicName) {
+      const vmId = vmIdByNicName.get(norm(nsg.nicName));
+      const vm = vmId ? placedVms.find(v => v.id === vmId) : null;
+      if (!vm) continue;
+      const nic = nicByVmId.get(vm.id);
+      // Place beside the NIC shopfront, perpendicular to its facing direction.
+      const fx = nic?.facing[0] ?? 0;
+      const fz = nic?.facing[1] ?? 1;
+      const lateral = VM_SPACING * 0.55;
+      placedNsgs.push({
+        ...nsg,
+        pos: [vm.pos[0] + (-fz) * lateral + fx * 0.3, vm.pos[2] + fx * lateral + fz * 0.3],
+        facing: [fx, fz],
+        attachedSubnetId: null,
+        attachedVmId: vm.id,
+      });
+    }
+  }
+
+  // ---- Public IPs: hover next to the NIC shopfront of the attached VM ----
+  const placedPublicIps: PlacedPublicIp[] = [];
+  for (const pip of graph.publicIps) {
+    if (!pip.attachedNic) continue;
+    const vmId = vmIdByNicName.get(norm(pip.attachedNic));
+    const vm = vmId ? placedVms.find(v => v.id === vmId) : null;
+    if (!vm) continue;
+    const nic = nicByVmId.get(vm.id);
+    const fx = nic?.facing[0] ?? 0;
+    const fz = nic?.facing[1] ?? 1;
+    const offset = VM_SPACING * 0.5;
+    placedPublicIps.push({
+      ...pip,
+      pos: [vm.pos[0] + fx * offset + (-fz) * (offset * 0.5),
+            vm.pos[2] + fz * offset + (fx) * (offset * 0.5)],
+      attachedVmId: vm.id,
+    });
+  }
+
+  // ---- Storage accounts: services strip along the south edge of the world ----
+  // Storage isn't network-attached, so it sits off the districts in a single
+  // row, grouped by RG with a small gap between groups.
+  const placedStorage: PlacedStorage[] = [];
+  if (graph.storage.length > 0) {
+    // Sort by RG, then name, so RG groups stay together.
+    const sorted = [...graph.storage].sort((a, b) =>
+      a.rg === b.rg ? a.name.localeCompare(b.name) : a.rg.localeCompare(b.rg));
+    // Compute total strip width to centre under the world bounds.
+    const widths: number[] = [];
+    let prevRg: string | null = null;
+    for (const s of sorted) {
+      widths.push(STORAGE_PITCH + (prevRg !== null && prevRg !== s.rg ? STORAGE_RG_GAP : 0));
+      prevRg = s.rg;
+    }
+    const totalWidth = widths.reduce((a, b) => a + b, 0);
+    const stripCx = placedVnets.length
+      ? placedVnets.reduce((sum, v) => sum + v.center[0], 0) / placedVnets.length
+      : 0;
+    const stripStartX = stripCx - totalWidth / 2 + STORAGE_PITCH / 2;
+    const stripZ = (placedVnets.length
+      ? Math.max(...placedVnets.map(v => v.center[1] + v.size / 2))
+      : 0) + STORAGE_OFFSET;
+    let cursorX = stripStartX;
+    prevRg = null;
+    for (const s of sorted) {
+      if (prevRg !== null && prevRg !== s.rg) cursorX += STORAGE_RG_GAP;
+      // Storeys: bigger SKU/kind → taller car park.
+      const skuLow = s.sku.toLowerCase();
+      const kindLow = s.kind.toLowerCase();
+      let storeys = 3;
+      if (skuLow.includes('premium')) storeys += 2;
+      if (skuLow.includes('zrs') || skuLow.includes('grs')) storeys += 1;
+      if (kindLow.includes('blob')) storeys += 1;
+      if (s.tier === 'archive') storeys = Math.max(2, storeys - 1);
+      placedStorage.push({ ...s, pos: [cursorX, stripZ], storeys });
+      cursorX += STORAGE_PITCH;
+      prevRg = s.rg;
+    }
+  }
+
+  // ---- Bounds: include the services strip too so the camera can frame it ----
   const xs = placedVnets.flatMap(v => [v.center[0] - v.size / 2, v.center[0] + v.size / 2]);
   const zs = placedVnets.flatMap(v => [v.center[1] - v.size / 2, v.center[1] + v.size / 2]);
+  const stripXs = placedStorage.map(s => s.pos[0]);
+  const stripZs = placedStorage.map(s => s.pos[1]);
   const bounds = {
-    min: [Math.min(...xs, -10), Math.min(...zs, -10)] as [number, number],
-    max: [Math.max(...xs, 10), Math.max(...zs, 10)] as [number, number],
+    min: [
+      Math.min(...xs, ...stripXs.map(x => x - STORAGE_PITCH / 2), -10),
+      Math.min(...zs, ...stripZs.map(z => z - 4), -10),
+    ] as [number, number],
+    max: [
+      Math.max(...xs, ...stripXs.map(x => x + STORAGE_PITCH / 2), 10),
+      Math.max(...zs, ...stripZs.map(z => z + 4), 10),
+    ] as [number, number],
   };
 
   return {
@@ -172,10 +309,18 @@ export function buildWorld(graph: Graph): World {
     subnets: placedSubnets,
     vnets: placedVnets,
     peerings: graph.peerings,
+    nics: placedNics,
+    nsgs: placedNsgs,
+    publicIps: placedPublicIps,
+    storage: placedStorage,
     bounds,
     vnetById,
     subnetById,
   };
+}
+
+function norm(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
 function clamp01(n: number): number {

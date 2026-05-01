@@ -1,5 +1,5 @@
 import * as XLSX from 'xlsx';
-import type { Graph, Vm, Vnet, Subnet, Peering } from './types';
+import type { Graph, Vm, Vnet, Subnet, Peering, Nsg, PublicIp, StorageAccount, StorageTier } from './types';
 import { lookupSku } from './sku';
 
 type Row = Record<string, unknown>;
@@ -80,22 +80,31 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   const subnetSheet  = findSheet(wb, ['Subnets', 'Subnet']);
   const nicSheet     = findSheet(wb, ['Network Interface', 'NetworkInterface', 'NIC', 'NICs']);
   const peerSheet    = findSheet(wb, ['VNET Peerings', 'Peering', 'Peerings']);
+  const nsgSheet     = findSheet(wb, ['Network Security Groups', 'NSG', 'NetworkSecurityGroups', 'NSGs']);
+  const pipSheet     = findSheet(wb, ['Public IPs', 'Public IP Addresses', 'PublicIP', 'Public IP']);
+  const storageSheet = findSheet(wb, ['Storage Accounts', 'Storage', 'StorageAccount', 'StorageAccounts']);
 
   const detection = {
-    vm:      Boolean(vmSheet),
-    vnet:    Boolean(vnetSheet),
-    subnet:  Boolean(subnetSheet),
-    nic:     Boolean(nicSheet),
-    peering: Boolean(peerSheet),
+    vm:        Boolean(vmSheet),
+    vnet:      Boolean(vnetSheet),
+    subnet:    Boolean(subnetSheet),
+    nic:       Boolean(nicSheet),
+    peering:   Boolean(peerSheet),
+    nsg:       Boolean(nsgSheet),
+    publicIp:  Boolean(pipSheet),
+    storage:   Boolean(storageSheet),
   };
 
-  log(`Detected sheets — VM:${vmSheet ?? '—'}  VNET:${vnetSheet ?? '—'}  Subnet:${subnetSheet ?? '—'}  NIC:${nicSheet ?? '—'}  Peer:${peerSheet ?? '—'}`);
+  log(`Detected sheets — VM:${vmSheet ?? '—'}  VNET:${vnetSheet ?? '—'}  Subnet:${subnetSheet ?? '—'}  NIC:${nicSheet ?? '—'}  Peer:${peerSheet ?? '—'}  NSG:${nsgSheet ?? '—'}  PIP:${pipSheet ?? '—'}  Storage:${storageSheet ?? '—'}`);
 
-  const vmRows     = readSheet(wb, vmSheet);
-  const vnetRows   = readSheet(wb, vnetSheet);
-  const subnetRows = readSheet(wb, subnetSheet);
-  const nicRows    = readSheet(wb, nicSheet);
-  const peerRows   = readSheet(wb, peerSheet);
+  const vmRows      = readSheet(wb, vmSheet);
+  const vnetRows    = readSheet(wb, vnetSheet);
+  const subnetRows  = readSheet(wb, subnetSheet);
+  const nicRows     = readSheet(wb, nicSheet);
+  const peerRows    = readSheet(wb, peerSheet);
+  const nsgRows     = readSheet(wb, nsgSheet);
+  const pipRows     = readSheet(wb, pipSheet);
+  const storageRows = readSheet(wb, storageSheet);
 
   // ---- VNets ----
   const vnetByKey = new Map<string, Vnet>();
@@ -142,20 +151,25 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   }
 
   // ---- NICs: VM -> Subnet attachment ----
-  const nicByVm = new Map<string, { subnetKey: string; ip: string }>();
+  // Also build a reverse map (nicName -> vmId) so PublicIP/NSG sheets can
+  // resolve their attachment by NIC name back to a VM.
+  const nicByVm = new Map<string, { subnetKey: string; ip: string; nicName: string }>();
+  const vmIdByNicName = new Map<string, string>();
   for (const r of nicRows) {
+    const nicName = pick(r, ['Name', 'NIC Name', 'Network Interface']);
     const vmName = pick(r, ['Virtual Machine', 'VM Name', 'VM', 'Owner', 'Attached To']);
     const subnetName = pick(r, ['Subnet', 'Subnet Name']);
     const vnetName = pick(r, ['Virtual Network', 'VNET', 'VNet', 'Network']);
     const ip = pick(r, ['Private IP', 'Private IP Address', 'IP', 'Primary IP']);
     if (!vmName) continue;
+    if (nicName) vmIdByNicName.set(norm(nicName), norm(vmName));
     if (vnetName && subnetName) {
       addSubnet(vnetName, subnetName, '');
-      nicByVm.set(norm(vmName), { subnetKey: subnetId(vnetName, subnetName), ip });
+      nicByVm.set(norm(vmName), { subnetKey: subnetId(vnetName, subnetName), ip, nicName });
     } else if (subnetName) {
       // Subnet only — match by subnet name across known subnets.
       const candidate = [...subnetByKey.values()].find(s => norm(s.name) === norm(subnetName));
-      if (candidate) nicByVm.set(norm(vmName), { subnetKey: candidate.id, ip });
+      if (candidate) nicByVm.set(norm(vmName), { subnetKey: candidate.id, ip, nicName });
     }
   }
 
@@ -206,6 +220,7 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
       ramGB,
       subnetId: subnetIdLink,
       privateIp: nic?.ip ?? null,
+      nicName: nic?.nicName ?? null,
       unknownSku,
     });
   }
@@ -217,6 +232,64 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
     const b = pick(r, ['VNet 2', 'Target VNet', 'To VNet', 'Remote VNet', 'Peer VNet', 'Remote Virtual Network']);
     if (!a || !b) continue;
     peerings.push({ a: norm(a), b: norm(b), state: pick(r, ['State', 'Peering State', 'Status']) });
+  }
+
+  // ---- NSGs ----
+  const nsgs: Nsg[] = [];
+  for (const r of nsgRows) {
+    const name = pick(r, ['Name', 'NSG Name', 'Network Security Group']);
+    if (!name) continue;
+    const subnetName = pick(r, ['Subnet', 'Subnet Name', 'Associated Subnet']);
+    const vnetName = pick(r, ['Virtual Network', 'VNET', 'VNet', 'Associated VNet']);
+    const nicName = pick(r, ['Network Interface', 'NIC', 'NIC Name', 'Associated NIC']);
+    nsgs.push({
+      id: norm(name),
+      name,
+      rg: pick(r, ['Resource Group', 'ResourceGroup', 'RG']),
+      location: pick(r, ['Location', 'Region']),
+      subnetId: (vnetName && subnetName) ? subnetId(vnetName, subnetName)
+                : (subnetName ? ([...subnetByKey.values()].find(s => norm(s.name) === norm(subnetName))?.id ?? null)
+                : null),
+      nicName: nicName || null,
+    });
+  }
+
+  // ---- Public IPs ----
+  const publicIps: PublicIp[] = [];
+  for (const r of pipRows) {
+    const name = pick(r, ['Name', 'Public IP Name', 'PublicIP Name']);
+    if (!name) continue;
+    const nicName = pick(r, ['Network Interface', 'NIC', 'NIC Name', 'Associated NIC', 'Attached To']);
+    publicIps.push({
+      id: norm(name),
+      name,
+      rg: pick(r, ['Resource Group', 'ResourceGroup', 'RG']),
+      location: pick(r, ['Location', 'Region']),
+      ipAddress: pick(r, ['IP Address', 'Address', 'IP', 'Public IP', 'PublicIP']),
+      sku: pick(r, ['SKU', 'Sku', 'Tier']) || 'Basic',
+      attachedNic: nicName || null,
+    });
+  }
+
+  // ---- Storage Accounts ----
+  const storage: StorageAccount[] = [];
+  for (const r of storageRows) {
+    const name = pick(r, ['Name', 'Storage Account', 'Account Name']);
+    if (!name) continue;
+    const tierRaw = pick(r, ['Access Tier', 'Tier', 'Default Access Tier']).toLowerCase();
+    const tier: StorageTier = tierRaw.includes('archive') ? 'archive'
+                            : tierRaw.includes('cool')    ? 'cool'
+                            : tierRaw.includes('hot')     ? 'hot'
+                            : 'unknown';
+    storage.push({
+      id: norm(name),
+      name,
+      rg: pick(r, ['Resource Group', 'ResourceGroup', 'RG']),
+      location: pick(r, ['Location', 'Region']),
+      kind: pick(r, ['Kind', 'Storage Kind', 'Account Kind']),
+      sku: pick(r, ['SKU', 'Sku', 'Replication']),
+      tier,
+    });
   }
 
   // ---- Group structures ----
@@ -240,8 +313,8 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   if (orphanCount > 0) notes.push(`${orphanCount} VM(s) could not be linked to a subnet — placed in an "unattached" pad.`);
   if (!detection.nic) notes.push(`No NIC sheet found — VM/subnet links inferred from the VM sheet.`);
 
-  log(`Parsed: ${vms.length} VMs · ${vnets.length} VNets · ${subnets.length} subnets · ${peerings.length} peerings`);
+  log(`Parsed: ${vms.length} VMs · ${vnets.length} VNets · ${subnets.length} subnets · ${peerings.length} peerings · ${nsgs.length} NSGs · ${publicIps.length} PIPs · ${storage.length} storage`);
   if (notes.length) for (const n of notes) log(`  · ${n}`);
 
-  return { vms, vnets, subnets, peerings, vmsBySubnet, subnetsByVnet, detection, notes };
+  return { vms, vnets, subnets, peerings, nsgs, publicIps, storage, vmsBySubnet, subnetsByVnet, detection, notes };
 }

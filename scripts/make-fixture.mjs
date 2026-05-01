@@ -45,11 +45,39 @@ const peerings = [
   { 'VNet 1': 'vnet-prod', 'VNet 2': 'vnet-corp', State: 'Connected' },
 ];
 
-XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(vms),      'Virtual Machines');
-XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(vnets),    'Virtual Network');
-XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(subnets),  'Subnets');
-XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(nics),     'Network Interface');
-XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(peerings), 'VNET Peerings');
+// Network Security Groups: subnet-attached gates protecting the web/data tiers,
+// plus one NIC-attached NSG on the corp jump host.
+const nsgs = [
+  { Name: 'nsg-web',   'Resource Group': 'rg-network', Location: 'westeurope',  'Virtual Network': 'vnet-prod', Subnet: 'snet-web',  'Network Interface': '' },
+  { Name: 'nsg-app',   'Resource Group': 'rg-network', Location: 'westeurope',  'Virtual Network': 'vnet-prod', Subnet: 'snet-app',  'Network Interface': '' },
+  { Name: 'nsg-data',  'Resource Group': 'rg-network', Location: 'westeurope',  'Virtual Network': 'vnet-prod', Subnet: 'snet-data', 'Network Interface': '' },
+  { Name: 'nsg-jump',  'Resource Group': 'rg-network', Location: 'northeurope', 'Virtual Network': '',          Subnet: '',          'Network Interface': 'nic-jump' },
+];
+
+// Public IPs: one per web frontend, plus one on the jump host for inbound RDP.
+const publicIps = [
+  { Name: 'pip-web-01', 'Resource Group': 'rg-frontend', Location: 'westeurope',  'IP Address': '20.50.10.10', SKU: 'Standard', 'Network Interface': 'nic-web-01' },
+  { Name: 'pip-web-02', 'Resource Group': 'rg-frontend', Location: 'westeurope',  'IP Address': '20.50.10.11', SKU: 'Standard', 'Network Interface': 'nic-web-02' },
+  { Name: 'pip-jump',   'Resource Group': 'rg-corp',     Location: 'northeurope', 'IP Address': '20.50.20.5',  SKU: 'Basic',    'Network Interface': 'nic-jump'   },
+];
+
+// Storage Accounts spread across the four RGs, mixing tiers and SKUs.
+const storage = [
+  { Name: 'stwebassets01', 'Resource Group': 'rg-frontend', Location: 'westeurope',  Kind: 'StorageV2',   SKU: 'Standard_LRS', 'Access Tier': 'Hot'  },
+  { Name: 'stappstate01',  'Resource Group': 'rg-app',      Location: 'westeurope',  Kind: 'StorageV2',   SKU: 'Standard_ZRS', 'Access Tier': 'Hot'  },
+  { Name: 'stdbbackup01',  'Resource Group': 'rg-data',     Location: 'westeurope',  Kind: 'BlobStorage', SKU: 'Standard_GRS', 'Access Tier': 'Cool' },
+  { Name: 'stdbarchive01', 'Resource Group': 'rg-data',     Location: 'westeurope',  Kind: 'BlobStorage', SKU: 'Standard_LRS', 'Access Tier': 'Archive' },
+  { Name: 'stcorpfiles01', 'Resource Group': 'rg-corp',     Location: 'northeurope', Kind: 'FileStorage', SKU: 'Premium_LRS',  'Access Tier': 'Hot'  },
+];
+
+XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(vms),       'Virtual Machines');
+XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(vnets),     'Virtual Network');
+XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(subnets),   'Subnets');
+XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(nics),      'Network Interface');
+XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(peerings),  'VNET Peerings');
+XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(nsgs),      'Network Security Groups');
+XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(publicIps), 'Public IPs');
+XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(storage),   'Storage Accounts');
 
 mkdirSync('fixtures', { recursive: true });
 const out = 'fixtures/sample-ari.xlsx';

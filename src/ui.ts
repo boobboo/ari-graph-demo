@@ -7,7 +7,12 @@ export function showStats(graph: Graph, world: World) {
   const orphans = graph.vms.filter(v => !v.subnetId).length;
   const lines: string[] = [];
   lines.push(`<b>${graph.vms.length}</b> VMs  ·  <b>${world.subnets.length}</b> subnets  ·  <b>${graph.vnets.length}</b> VNets`);
-  lines.push(`<span class="k">${graph.peerings.length}</span> peerings`);
+  const services: string[] = [];
+  services.push(`<span class="k">${graph.peerings.length}</span> peerings`);
+  if (graph.nsgs.length)      services.push(`<span class="k">${graph.nsgs.length}</span> NSGs`);
+  if (graph.publicIps.length) services.push(`<span class="k">${graph.publicIps.length}</span> public IPs`);
+  if (graph.storage.length)   services.push(`<span class="k">${graph.storage.length}</span> storage acct${graph.storage.length === 1 ? '' : 's'}`);
+  lines.push(services.join('  ·  '));
   if (unknownSku) lines.push(`<span class="k">${unknownSku}</span> unrecognised SKUs`);
   if (orphans)   lines.push(`<span class="k">${orphans}</span> VMs not linked to a subnet`);
   for (const note of graph.notes) lines.push(`<span style="color:#9fb1c7">${escapeHtml(note)}</span>`);

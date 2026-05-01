@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { setupUpload } from './upload';
 import { parseAri } from './parser';
 import { buildWorld } from './layout';
-import { buildScene, type BuiltScene } from './world';
+import { buildScene, type BuiltScene, type ServiceTip } from './world';
 import { createFlyControls, type FlyControls } from './controls';
 import {
   showStats, setLog, clearLog, showLanding,
@@ -88,19 +88,30 @@ async function loadFile(buf: ArrayBuffer, name: string) {
     last = now;
     fly.update(dt);
 
-    // Hover tooltip via raycast from screen centre.
+    // Hover tooltip via raycast from screen centre. We test VM towers AND
+    // service-building targets (NSGs, Public IPs, Storage car parks) and pick
+    // whichever the ray hits first.
     if (fly.isLocked()) {
       raycaster.setFromCamera(screenCenter, camera);
-      const hits = raycaster.intersectObjects(built.vmTowers, false);
-      if (hits.length > 0 && typeof hits[0].instanceId === 'number') {
-        const inst = hits[0].object as THREE.InstancedMesh;
-        const list = built.vmInstanceMap.get(inst);
-        if (list) {
-          const vm = list[hits[0].instanceId];
+      const vmHits = raycaster.intersectObjects(built.vmTowers, false);
+      const serviceHits = built.serviceTargets.length
+        ? raycaster.intersectObjects(built.serviceTargets, false)
+        : [];
+      const vmDist = vmHits[0]?.distance ?? Infinity;
+      const svcDist = serviceHits[0]?.distance ?? Infinity;
+      if (vmDist === Infinity && svcDist === Infinity) {
+        setTooltip(null);
+      } else if (vmDist <= svcDist) {
+        const hit = vmHits[0];
+        if (typeof hit.instanceId === 'number') {
+          const inst = hit.object as THREE.InstancedMesh;
+          const list = built.vmInstanceMap.get(inst);
+          const vm = list?.[hit.instanceId];
           if (vm) setTooltip(formatVm(vm));
         }
       } else {
-        setTooltip(null);
+        const tip = built.serviceLookup.get(serviceHits[0].object);
+        if (tip) setTooltip(formatService(tip));
       }
     }
 
@@ -134,6 +145,34 @@ function formatVm(vm: { name: string; sku: string; vCPU: number; ramGB: number; 
 
 function formatRam(gb: number): string {
   return gb >= 100 ? gb.toFixed(0) : gb.toFixed(1).replace(/\.0$/, '');
+}
+
+function formatService(tip: ServiceTip): string {
+  const rows: string[] = [];
+  if (tip.kind === 'nsg') {
+    const n = tip.data;
+    rows.push(`<b>${escapeHtml(n.name)}</b> · NSG`);
+    if (n.subnetId) rows.push(`Attached: subnet <code>${escapeHtml(n.subnetId)}</code>`);
+    else if (n.nicName) rows.push(`Attached: NIC <code>${escapeHtml(n.nicName)}</code>`);
+    if (n.rg) rows.push(`RG: ${escapeHtml(n.rg)}`);
+    if (n.location) rows.push(`Region: ${escapeHtml(n.location)}`);
+  } else if (tip.kind === 'publicIp') {
+    const p = tip.data;
+    rows.push(`<b>${escapeHtml(p.name)}</b> · Public IP`);
+    if (p.ipAddress) rows.push(`IP: <code>${escapeHtml(p.ipAddress)}</code>`);
+    if (p.sku) rows.push(`SKU: ${escapeHtml(p.sku)}`);
+    if (p.attachedNic) rows.push(`NIC: ${escapeHtml(p.attachedNic)}`);
+    if (p.rg) rows.push(`RG: ${escapeHtml(p.rg)}`);
+  } else {
+    const s = tip.data;
+    rows.push(`<b>${escapeHtml(s.name)}</b> · Storage`);
+    if (s.kind) rows.push(`Kind: ${escapeHtml(s.kind)}`);
+    if (s.sku) rows.push(`SKU: ${escapeHtml(s.sku)}`);
+    if (s.tier && s.tier !== 'unknown') rows.push(`Tier: ${escapeHtml(s.tier)}`);
+    if (s.rg) rows.push(`RG: ${escapeHtml(s.rg)}`);
+    if (s.location) rows.push(`Region: ${escapeHtml(s.location)}`);
+  }
+  return rows.join('<br/>');
 }
 
 // ---- Wire up landing page ----

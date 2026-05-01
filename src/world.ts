@@ -1,82 +1,122 @@
 import * as THREE from 'three';
-import type { World, PlacedVm } from './types';
+import type { World, PlacedVm, PlacedNsg, PlacedPublicIp, PlacedStorage } from './types';
 
-// ---- SimCity-style tunables ----
-// VNets are hills. Subnets are neighborhood plots on the hilltop. VMs are
-// houses, sized by vCPU + RAM. Subnets are wired by little streets, VNets
-// are joined by bridge-roads where peerings exist.
-const HILL_BASE_HEIGHT = 3.5;       // shortest VNet hill, before bonus rises
-const HILL_PER_SUBNET = 1.2;        // each extra subnet raises the hill
-const HILL_PER_PEERING = 2.0;       // each peering on this VNet raises the hill more
-const HILL_TOP_INSET = 6;           // top plateau is smaller than the base footprint
-const HILL_SIDES = 12;              // octagonal-ish low-poly hill
-const PLOT_LIFT = 0.18;             // subnet plot sits this far above the hill plateau
-const ROAD_LIFT = 0.04;             // roads sit just above the plot
-const ROAD_HALFWIDTH = 0.55;        // thickness of a residential street
+// ---- Semantic-mapping tunables (see plan) ------------------------------
+// The whole map is one flat city. VNets are walled districts whose colour
+// reflects the network. Subnets are neighbourhood blocks within the district.
+// VMs are tower blocks (RAM = footprint, vCPU = storeys, OS = cladding).
+// NICs are shopfronts on the side of the tower facing the subnet road.
+// Peerings are bridge-roads between districts, threading through gate
+// openings cut in the walls. NSGs are police checkpoints; Public IPs are
+// flagpoles; Storage Accounts are multistorey car parks lined up off-network
+// in a "services strip" along the south edge of the map.
+
+// Districts (VNets)
+const DISTRICT_FLOOR_HEIGHT = 0.3;
+const WALL_HEIGHT = 1.6;
+const WALL_THICKNESS = 0.6;
+const GATE_WIDTH = 6;            // opening in the wall where a road enters
+
+// Subnets
+const PLOT_LIFT = 0.22;
+const PLOT_THICKNESS = 0.28;
+const KERB_HEIGHT = 0.22;
+const KERB_THICKNESS = 0.18;
+
+// Tower blocks (VMs)
+const TOWER_FOOTPRINT_MIN = 1.7;
+const TOWER_FOOTPRINT_MAX = 2.6;
+const STOREY_HEIGHT = 0.9;
+const STOREY_MIN = 2;
+const STOREY_MAX = 18;
+const FLOOR_BAND_THICKNESS = 0.06;
+const FLOOR_BAND_INSET = 0.04;   // how much wider than the tower the band extends
+const TOWER_BODY: Record<string, number> = {
+  linux:   0xc8a576,   // warm tan/sandstone
+  windows: 0xb9cad9,   // pale blue glass
+  other:   0xb6b6b0,   // neutral concrete
+};
+const TOWER_BAND: Record<string, number> = {
+  linux:   0x6e4f30,
+  windows: 0x4a6079,
+  other:   0x55564f,
+};
+
+// NIC shopfronts
+const SHOPFRONT_W = 1.2;
+const SHOPFRONT_H = 0.7;
+const SHOPFRONT_D = 0.5;
+
+// Roads
+const ROAD_LIFT = 0.04;
+const ROAD_HALFWIDTH = 0.55;
 const MAIN_ROAD_HALFWIDTH = 0.95;
-const BRIDGE_HALFWIDTH = 1.1;
-const HOUSE_MIN = 1.6;              // smallest house side (small VM)
-const HOUSE_MAX = 3.6;              // largest house side (huge VM)
-const HOUSE_ROOF_PITCH = 0.7;       // roof height as a fraction of body width
-const HOUSE_BODY_HEIGHT = 1.2;      // body height fraction of side
-const BRIDGE_HEIGHT = 0.5;          // 3D bridge thickness so it reads from any angle
+const BRIDGE_HALFWIDTH = 1.2;
+const BRIDGE_HEIGHT = 0.4;
+const ROAD_COLOR = 0x4d4a44;
+const GROUND_COLOR = 0x445948;
+const SUBNET_PLOT_COLOR = 0xb1c986;
+const KERB_COLOR = 0xd9d3c0;
 
-const HOUSE_COLORS: Record<string, number> = {
-  linux:   0xd6a45a,   // warm tan stucco
-  windows: 0xc4d3e0,   // pale blue siding
-  other:   0xb6b6b0,   // grey siding
-};
-const ROOF_COLORS: Record<string, number> = {
-  linux:   0x8b4f2e,   // brown shingle
-  windows: 0x4a5a6c,   // slate
-  other:   0x555550,   // charcoal
-};
+// NSG (police checkpoint)
+const NSG_BODY_COLOR = 0x355bb5;
+const NSG_BODY_W = 1.4;
+const NSG_BODY_H = 1.4;
+const NSG_BODY_D = 1.4;
+const BARRIER_LEN = 4.2;
+const BARRIER_THICK = 0.18;
 
-const HILL_SIDE_COLOR = 0x6f9c5c;      // grass slope
-const HILL_TOP_COLOR = 0x88b46a;       // brighter top grass
-const PLOT_COLOR = 0xa6c97a;           // mowed neighborhood lawn
-const ROAD_COLOR = 0x5a5a55;           // asphalt
-const GROUND_COLOR = 0x4d6a4a;         // surrounding meadow / countryside
+// Public IP (flagpole)
+const FLAGPOLE_HEIGHT = 3.4;
+const FLAGPOLE_RADIUS = 0.07;
+const FLAG_W = 1.0;
+const FLAG_H = 0.55;
+const FLAG_COLOR_STANDARD = 0x4ec27d;
+const FLAG_COLOR_BASIC = 0x9aa29a;
+
+// Storage car park
+const CARPARK_W = 4.4;
+const CARPARK_D = 5.6;
+const CARPARK_BODY_COLOR = 0x9a8d76;
+const CARPARK_FLOOR_COLOR = 0x615746;
+const CARPARK_TIER_TINT: Record<string, number> = {
+  hot:     0xb4a888,
+  cool:    0x8aa4a8,
+  archive: 0x6c6358,
+  unknown: 0x9a8d76,
+};
 
 export interface BuiltScene {
   scene: THREE.Scene;
-  vmTowers: THREE.InstancedMesh[];      // bodies are the hover targets
+  vmTowers: THREE.InstancedMesh[];
   vmIndex: PlacedVm[];
   vmInstanceMap: Map<THREE.InstancedMesh, PlacedVm[]>;
+  serviceTargets: THREE.Object3D[];
+  serviceLookup: Map<THREE.Object3D, ServiceTip>;
   spawn: { pos: THREE.Vector3; lookAt: THREE.Vector3 };
   dispose(): void;
 }
 
+export type ServiceTip =
+  | { kind: 'nsg'; data: PlacedNsg }
+  | { kind: 'publicIp'; data: PlacedPublicIp }
+  | { kind: 'storage'; data: PlacedStorage };
+
 export function buildScene(world: World): BuiltScene {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0xc7e1f0);
-  scene.fog = new THREE.Fog(0xc7e1f0, 140, 800);
+  scene.fog = new THREE.Fog(0xc7e1f0, 220, 1200);
 
-  // ---- Lights: warm key, cool fill ----
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.65));
-  const sun = new THREE.DirectionalLight(0xfff0d8, 1.0);
-  sun.position.set(120, 200, 80);
+  // ---- Lights ----
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.7));
+  const sun = new THREE.DirectionalLight(0xfff0d8, 1.05);
+  sun.position.set(140, 220, 90);
   scene.add(sun);
-  const fill = new THREE.DirectionalLight(0xa9c4ff, 0.35);
+  const fill = new THREE.DirectionalLight(0xa9c4ff, 0.3);
   fill.position.set(-100, 60, -90);
   scene.add(fill);
 
   const disposables: Array<{ dispose(): void }> = [];
-
-  // ---- Hill heights driven by subnet count + peering count ----
-  const peeringCount = new Map<string, number>();
-  for (const p of world.peerings) {
-    peeringCount.set(p.a, (peeringCount.get(p.a) ?? 0) + 1);
-    peeringCount.set(p.b, (peeringCount.get(p.b) ?? 0) + 1);
-  }
-  const subnetCountByVnet = new Map<string, number>();
-  for (const s of world.subnets) {
-    subnetCountByVnet.set(s.vnetId, (subnetCountByVnet.get(s.vnetId) ?? 0) + 1);
-  }
-  const vnetHeight = (vnId: string) =>
-    HILL_BASE_HEIGHT
-    + HILL_PER_SUBNET * (subnetCountByVnet.get(vnId) ?? 0)
-    + HILL_PER_PEERING * (peeringCount.get(vnId) ?? 0);
 
   // ---- Surrounding countryside ----
   const span = Math.max(
@@ -93,63 +133,106 @@ export function buildScene(world: World): BuiltScene {
   scene.add(ground);
   disposables.push(ground.geometry, ground.material as THREE.Material);
 
-  // ---- Hills (one frustum per VNet) ----
-  interface HillInfo { yTop: number; cx: number; cz: number; topRadius: number; }
-  const hillByVnet = new Map<string, HillInfo>();
+  // ---- Districts (VNets) ----
+  // Each VNet renders as a flat coloured slab plus a low boundary wall.
+  // Gates are cut in the wall on each face that has a peering bridge entering.
+  // For each VNet we precompute the per-face gate offsets.
+  interface DistrictGeom { cx: number; cz: number; halfW: number; halfD: number; color: number; }
+  const districtByVnet = new Map<string, DistrictGeom>();
   for (const vn of world.vnets) {
-    const h = vnetHeight(vn.id);
-    const baseR = vn.size * 0.55 + 6;
-    const topR = Math.max(vn.size * 0.45 + 2, baseR - HILL_TOP_INSET);
-    const geom = new THREE.CylinderGeometry(topR, baseR, h, HILL_SIDES, 1, false);
-    const sideMat = new THREE.MeshLambertMaterial({ color: HILL_SIDE_COLOR });
-    const hill = new THREE.Mesh(geom, sideMat);
-    hill.position.set(vn.center[0], h / 2, vn.center[1]);
-    scene.add(hill);
-    disposables.push(geom, sideMat);
-
-    // Brighter grass cap so the plateau reads clearly.
-    const capGeom = new THREE.CylinderGeometry(topR, topR, 0.18, HILL_SIDES, 1, false);
-    const capMat = new THREE.MeshLambertMaterial({ color: HILL_TOP_COLOR });
-    const cap = new THREE.Mesh(capGeom, capMat);
-    cap.position.set(vn.center[0], h + 0.09, vn.center[1]);
-    scene.add(cap);
-    disposables.push(capGeom, capMat);
-
-    hillByVnet.set(vn.id, { yTop: h + 0.18, cx: vn.center[0], cz: vn.center[1], topRadius: topR });
-
-    addLabelSprite(scene, vn.name, vn.center[0], h + 4.0, vn.center[1], 1.1, 0xffffff, disposables, Math.min(vn.size, 22));
+    const halfW = vn.size / 2 + 4;
+    const halfD = vn.size / 2 + 4;
+    districtByVnet.set(vn.id, { cx: vn.center[0], cz: vn.center[1], halfW, halfD, color: vn.color });
   }
 
-  // ---- Subnet plots on the hilltops ----
-  interface PlotInfo { yTop: number; cx: number; cz: number; size: number; }
-  const plotBySubnet = new Map<string, PlotInfo>();
+  // For each district, what gate openings are needed on which face?
+  // Bridges connect two districts → each one drills a gate on the face nearest
+  // the other. We model a "gate" as (face, offset along that face).
+  type Face = 'north' | 'south' | 'east' | 'west';   // -z, +z, +x, -x
+  interface Gate { face: Face; offset: number; }     // offset along face in world units, centred
+  const gatesByVnet = new Map<string, Gate[]>();
+  for (const p of world.peerings) {
+    const a = districtByVnet.get(p.a);
+    const b = districtByVnet.get(p.b);
+    if (!a || !b) continue;
+    const gateA = pickGate(a, b);
+    const gateB = pickGate(b, a);
+    if (!gatesByVnet.has(p.a)) gatesByVnet.set(p.a, []);
+    if (!gatesByVnet.has(p.b)) gatesByVnet.set(p.b, []);
+    gatesByVnet.get(p.a)!.push(gateA);
+    gatesByVnet.get(p.b)!.push(gateB);
+  }
+
+  // Render the floor + walls for each district.
+  for (const vn of world.vnets) {
+    const d = districtByVnet.get(vn.id)!;
+    // Floor slab tinted by VNet colour.
+    const floorGeom = new THREE.BoxGeometry(d.halfW * 2, DISTRICT_FLOOR_HEIGHT, d.halfD * 2);
+    const floorMat = new THREE.MeshLambertMaterial({ color: vn.color });
+    const floor = new THREE.Mesh(floorGeom, floorMat);
+    floor.position.set(d.cx, DISTRICT_FLOOR_HEIGHT / 2, d.cz);
+    scene.add(floor);
+    disposables.push(floorGeom, floorMat);
+
+    // Walls (4 sides), each split around any gate openings.
+    const wallColor = darkenColor(vn.color, 0.35);
+    const wallMat = new THREE.MeshLambertMaterial({ color: wallColor });
+    disposables.push(wallMat);
+    const gates = gatesByVnet.get(vn.id) ?? [];
+    addWallSegments(scene, 'north', d, gates, wallMat, disposables);
+    addWallSegments(scene, 'south', d, gates, wallMat, disposables);
+    addWallSegments(scene, 'east',  d, gates, wallMat, disposables);
+    addWallSegments(scene, 'west',  d, gates, wallMat, disposables);
+
+    // District name above the district centre.
+    addLabelSprite(scene, vn.name, d.cx, WALL_HEIGHT + 3.6, d.cz, 1.0, 0xffffff, disposables, Math.min(vn.size, 22));
+  }
+
+  // ---- Subnets (neighbourhood blocks) ----
+  // A raised plot with a kerb ring around it.
   for (const s of world.subnets) {
-    const hill = hillByVnet.get(s.vnetId);
-    if (!hill) continue;
-    const plotSize = Math.max(s.size * 0.85, 6);
-    const yTop = hill.yTop + 0.12;
-    const plotGeom = new THREE.BoxGeometry(plotSize, 0.24, plotSize);
-    const plotMat = new THREE.MeshLambertMaterial({ color: PLOT_COLOR });
+    const plotSize = Math.max(s.size * 0.92, 6);
+    const plotY = DISTRICT_FLOOR_HEIGHT + PLOT_LIFT;
+    const plotGeom = new THREE.BoxGeometry(plotSize, PLOT_THICKNESS, plotSize);
+    const plotMat = new THREE.MeshLambertMaterial({ color: SUBNET_PLOT_COLOR });
     const plot = new THREE.Mesh(plotGeom, plotMat);
-    plot.position.set(s.center[0], hill.yTop + PLOT_LIFT, s.center[1]);
+    plot.position.set(s.center[0], plotY + PLOT_THICKNESS / 2, s.center[1]);
     scene.add(plot);
     disposables.push(plotGeom, plotMat);
-    plotBySubnet.set(s.id, { yTop, cx: s.center[0], cz: s.center[1], size: plotSize });
+
+    // Kerb ring: four thin bars on the plot's perimeter.
+    const kerbMat = new THREE.MeshLambertMaterial({ color: KERB_COLOR });
+    disposables.push(kerbMat);
+    const half = plotSize / 2;
+    const kerbY = plotY + PLOT_THICKNESS + KERB_HEIGHT / 2;
+    const horizGeom = new THREE.BoxGeometry(plotSize, KERB_HEIGHT, KERB_THICKNESS);
+    const vertGeom = new THREE.BoxGeometry(KERB_THICKNESS, KERB_HEIGHT, plotSize);
+    disposables.push(horizGeom, vertGeom);
+    const k1 = new THREE.Mesh(horizGeom, kerbMat); k1.position.set(s.center[0], kerbY, s.center[1] - half); scene.add(k1);
+    const k2 = new THREE.Mesh(horizGeom, kerbMat); k2.position.set(s.center[0], kerbY, s.center[1] + half); scene.add(k2);
+    const k3 = new THREE.Mesh(vertGeom,  kerbMat); k3.position.set(s.center[0] - half, kerbY, s.center[1]); scene.add(k3);
+    const k4 = new THREE.Mesh(vertGeom,  kerbMat); k4.position.set(s.center[0] + half, kerbY, s.center[1]); scene.add(k4);
 
     const lbl = s.cidr ? `${s.name} (${s.cidr})` : s.name;
-    addLabelSprite(scene, lbl, s.center[0], yTop + 0.5, s.center[1], 0.5, 0xffffff, disposables, Math.min(s.size, 12));
+    addLabelSprite(scene, lbl, s.center[0], kerbY + 0.6, s.center[1], 0.45, 0xffffff, disposables, Math.min(s.size, 12));
   }
 
-  // ---- Houses (VMs) ----
-  // Footprint scaled by composite CPU+RAM "tower height" already computed in
-  // layout.ts. Each VM gets a body cube + pyramid roof, instanced per OS.
-  const sizeFor = (vm: PlacedVm): number => {
-    const t = Math.min(1, Math.max(0, (vm.height - 1) / 31));
-    return HOUSE_MIN + (HOUSE_MAX - HOUSE_MIN) * Math.sqrt(t);
+  // The plot top is where towers sit.
+  const towerBaseY = DISTRICT_FLOOR_HEIGHT + PLOT_LIFT + PLOT_THICKNESS;
+
+  // ---- Tower blocks (VMs) ----
+  // RAM normalises across the file → footprint. vCPU normalises → storey count.
+  const vCPUs = world.vms.map(v => v.vCPU).filter(n => Number.isFinite(n) && n > 0);
+  const rams  = world.vms.map(v => v.ramGB).filter(n => Number.isFinite(n) && n > 0);
+  const minC = Math.min(...vCPUs, 1), maxC = Math.max(...vCPUs, minC + 1);
+  const minR = Math.min(...rams, 1),  maxR = Math.max(...rams, minR + 1);
+  const footprintFor = (vm: PlacedVm) => {
+    const t = clamp01((vm.ramGB - minR) / Math.max(1e-6, maxR - minR));
+    return TOWER_FOOTPRINT_MIN + (TOWER_FOOTPRINT_MAX - TOWER_FOOTPRINT_MIN) * Math.sqrt(t);
   };
-  const liftedY = (vm: PlacedVm): number => {
-    const plot = vm.subnetId ? plotBySubnet.get(vm.subnetId) : null;
-    return (plot?.yTop ?? 0) + 0.12;
+  const storeysFor = (vm: PlacedVm) => {
+    const t = clamp01((vm.vCPU - minC) / Math.max(1e-6, maxC - minC));
+    return Math.round(STOREY_MIN + t * (STOREY_MAX - STOREY_MIN));
   };
 
   const buckets: Record<string, PlacedVm[]> = { linux: [], windows: [], other: [] };
@@ -157,111 +240,217 @@ export function buildScene(world: World): BuiltScene {
 
   const vmTowers: THREE.InstancedMesh[] = [];
   const vmInstanceMap = new Map<THREE.InstancedMesh, PlacedVm[]>();
-  const bodyGeom = new THREE.BoxGeometry(1, 1, 1);
-  const roofGeom = new THREE.ConeGeometry(0.72, 1, 4);   // square pyramid
-  roofGeom.rotateY(Math.PI / 4);                          // sides axis-aligned
-  disposables.push(bodyGeom, roofGeom);
+  const towerGeom = new THREE.BoxGeometry(1, 1, 1);
+  const bandGeom = new THREE.BoxGeometry(1, 1, 1);
+  disposables.push(towerGeom, bandGeom);
 
   for (const os of Object.keys(buckets) as Array<keyof typeof buckets>) {
     const list = buckets[os];
     if (list.length === 0) continue;
-    const bodyMat = new THREE.MeshLambertMaterial({ color: HOUSE_COLORS[os] });
-    const roofMat = new THREE.MeshLambertMaterial({ color: ROOF_COLORS[os] });
-    disposables.push(bodyMat, roofMat);
-    const bodies = new THREE.InstancedMesh(bodyGeom, bodyMat, list.length);
-    const roofs = new THREE.InstancedMesh(roofGeom, roofMat, list.length);
+    const bodyMat = new THREE.MeshLambertMaterial({ color: TOWER_BODY[os] });
+    const bandMat = new THREE.MeshLambertMaterial({ color: TOWER_BAND[os] });
+    disposables.push(bodyMat, bandMat);
+
+    // Body instances: one per VM.
+    const bodies = new THREE.InstancedMesh(towerGeom, bodyMat, list.length);
     bodies.userData.os = os;
     const dummy = new THREE.Object3D();
     list.forEach((vm, i) => {
-      const side = sizeFor(vm);
-      const yPlot = liftedY(vm);
-      const bodyH = side * HOUSE_BODY_HEIGHT;
-      // Body: scale unit cube to side × bodyH × side; sit base on plot.
-      dummy.position.set(vm.pos[0], yPlot + bodyH / 2, vm.pos[2]);
-      dummy.scale.set(side, bodyH, side);
+      const fp = footprintFor(vm);
+      const totalH = storeysFor(vm) * STOREY_HEIGHT;
+      dummy.position.set(vm.pos[0], towerBaseY + totalH / 2, vm.pos[2]);
+      dummy.scale.set(fp, totalH, fp);
       dummy.rotation.set(0, 0, 0);
       dummy.updateMatrix();
       bodies.setMatrixAt(i, dummy.matrix);
-      // Pyramid roof on top of the body.
-      const roofH = side * HOUSE_ROOF_PITCH;
-      dummy.position.set(vm.pos[0], yPlot + bodyH + roofH / 2, vm.pos[2]);
-      dummy.scale.set(side * 1.18, roofH, side * 1.18);
-      dummy.updateMatrix();
-      roofs.setMatrixAt(i, dummy.matrix);
     });
     bodies.instanceMatrix.needsUpdate = true;
-    roofs.instanceMatrix.needsUpdate = true;
-    scene.add(bodies, roofs);
+    scene.add(bodies);
     vmTowers.push(bodies);
     vmInstanceMap.set(bodies, list);
+
+    // Floor banding: a thin band at the top of every storey of every tower.
+    // Total band count ≈ Σ storeys.
+    const bandCount = list.reduce((sum, vm) => sum + storeysFor(vm), 0);
+    if (bandCount > 0) {
+      const bands = new THREE.InstancedMesh(bandGeom, bandMat, bandCount);
+      let bi = 0;
+      for (const vm of list) {
+        const fp = footprintFor(vm);
+        const storeys = storeysFor(vm);
+        for (let s = 1; s <= storeys; s++) {
+          const y = towerBaseY + s * STOREY_HEIGHT;
+          dummy.position.set(vm.pos[0], y, vm.pos[2]);
+          dummy.scale.set(fp + FLOOR_BAND_INSET * 2, FLOOR_BAND_THICKNESS, fp + FLOOR_BAND_INSET * 2);
+          dummy.updateMatrix();
+          bands.setMatrixAt(bi++, dummy.matrix);
+        }
+      }
+      bands.instanceMatrix.needsUpdate = true;
+      scene.add(bands);
+    }
+  }
+
+  // ---- NIC shopfronts (one per NIC, on the road-facing side of the tower) ----
+  if (world.nics.length > 0) {
+    const shopGeom = new THREE.BoxGeometry(SHOPFRONT_W, SHOPFRONT_H, SHOPFRONT_D);
+    const shopMat = new THREE.MeshLambertMaterial({ color: 0xefe6c8 });
+    disposables.push(shopGeom, shopMat);
+    const shops = new THREE.InstancedMesh(shopGeom, shopMat, world.nics.length);
+    const dummy = new THREE.Object3D();
+    world.nics.forEach((nic, i) => {
+      // Nudge the shopfront flush against the tower base on the road-facing side.
+      const fp = (() => {
+        const vm = world.vms.find(v => v.id === nic.vmId);
+        return vm ? footprintFor(vm) : TOWER_FOOTPRINT_MIN;
+      })();
+      const baseX = nic.pos[0] + nic.facing[0] * (fp / 2 + SHOPFRONT_D / 2 - 0.05);
+      const baseZ = nic.pos[1] + nic.facing[1] * (fp / 2 + SHOPFRONT_D / 2 - 0.05);
+      dummy.position.set(baseX, towerBaseY + SHOPFRONT_H / 2, baseZ);
+      dummy.rotation.set(0, -Math.atan2(nic.facing[1], nic.facing[0]), 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      shops.setMatrixAt(i, dummy.matrix);
+    });
+    shops.instanceMatrix.needsUpdate = true;
+    scene.add(shops);
   }
 
   // ---- Streets ----
-  // Each subnet gets an "I-shape" of road: a centerline through its row of
-  // houses plus crossbars at both ends. Each subnet center is then connected
-  // to its hill's centerpoint via a wider main road.
-  const roadSegments: Array<{ ax: number; az: number; bx: number; bz: number; halfWidth: number; y: number; }> = [];
-
+  // For each subnet: a centerline street through its row of tower bases.
+  // Then a main road from the subnet centre to the district centre — that's
+  // the one a subnet-attached NSG sits on.
+  const roadSegments: Array<{ ax: number; az: number; bx: number; bz: number; halfWidth: number; }> = [];
   for (const s of world.subnets) {
-    const plot = plotBySubnet.get(s.id);
-    if (!plot) continue;
     const localVms = world.vms.filter(v => v.subnetId === s.id);
     if (localVms.length === 0) continue;
     const minX = Math.min(...localVms.map(v => v.pos[0]));
     const maxX = Math.max(...localVms.map(v => v.pos[0]));
-    const minZ = Math.min(...localVms.map(v => v.pos[2]));
-    const maxZ = Math.max(...localVms.map(v => v.pos[2]));
-    const yRoad = plot.yTop + ROAD_LIFT + 0.12;
-    // Long centerline through the houses.
-    roadSegments.push({ ax: minX - 1.5, az: plot.cz, bx: maxX + 1.5, bz: plot.cz, halfWidth: ROAD_HALFWIDTH, y: yRoad });
-    // End crossbars (only meaningful if there's vertical extent in the row layout).
-    if (maxZ - minZ > 0.5) {
-      roadSegments.push({ ax: minX - 1.5, az: minZ - 1.5, bx: minX - 1.5, bz: maxZ + 1.5, halfWidth: ROAD_HALFWIDTH, y: yRoad });
-      roadSegments.push({ ax: maxX + 1.5, az: minZ - 1.5, bx: maxX + 1.5, bz: maxZ + 1.5, halfWidth: ROAD_HALFWIDTH, y: yRoad });
-    }
+    roadSegments.push({ ax: minX - 1.5, az: s.center[1], bx: maxX + 1.5, bz: s.center[1], halfWidth: ROAD_HALFWIDTH });
   }
-
   for (const s of world.subnets) {
-    const plot = plotBySubnet.get(s.id);
-    const hill = hillByVnet.get(s.vnetId);
-    if (!plot || !hill) continue;
-    const yRoad = plot.yTop + ROAD_LIFT + 0.12;
     roadSegments.push({
-      ax: plot.cx, az: plot.cz, bx: hill.cx, bz: hill.cz,
-      halfWidth: MAIN_ROAD_HALFWIDTH, y: yRoad,
+      ax: s.center[0], az: s.center[1],
+      bx: s.vnetCenter[0], bz: s.vnetCenter[1],
+      halfWidth: MAIN_ROAD_HALFWIDTH,
     });
   }
+  const roadY = towerBaseY + ROAD_LIFT;
+  buildRoadMesh(scene, roadSegments, roadY, ROAD_COLOR, disposables);
 
-  buildRoadMesh(scene, roadSegments, ROAD_COLOR, disposables);
-
-  // ---- Bridges between peered VNets (3D boxes spanning hilltop to hilltop) ----
+  // ---- Bridges (peerings) ----
+  // 3D box at ground level passing through the gate openings of both districts.
   for (const p of world.peerings) {
-    const a = hillByVnet.get(p.a);
-    const b = hillByVnet.get(p.b);
+    const a = districtByVnet.get(p.a);
+    const b = districtByVnet.get(p.b);
     if (!a || !b) continue;
     addBridgeBox(scene, a, b, BRIDGE_HALFWIDTH * 2, BRIDGE_HEIGHT, ROAD_COLOR, disposables);
   }
 
-  // ---- Stub for service buildings (NSG / ASG / Storage) -----------------
-  // Parser doesn't yet surface NSG/ASG/Storage, so there's nothing to draw.
-  // Once parser exposes those (e.g. `world.services: { kind, cx, cz, vnetId }[]`),
-  // drop in a small block per kind: police = blue tower, fire = red boxy hall
-  // with a flag, shop = striped awning. No layout work needed beyond placing
-  // them at the perimeter of their nearest subnet plot.
+  // ---- NSGs (police checkpoints) ----
+  const serviceTargets: THREE.Object3D[] = [];
+  const serviceLookup = new Map<THREE.Object3D, ServiceTip>();
+  for (const nsg of world.nsgs) {
+    const bodyGeom = new THREE.BoxGeometry(NSG_BODY_W, NSG_BODY_H, NSG_BODY_D);
+    const bodyMat = new THREE.MeshLambertMaterial({ color: NSG_BODY_COLOR });
+    const body = new THREE.Mesh(bodyGeom, bodyMat);
+    body.position.set(nsg.pos[0], towerBaseY + NSG_BODY_H / 2, nsg.pos[1]);
+    body.rotation.y = -Math.atan2(nsg.facing[1], nsg.facing[0]);
+    scene.add(body);
+    disposables.push(bodyGeom, bodyMat);
+    serviceTargets.push(body);
+    serviceLookup.set(body, { kind: 'nsg', data: nsg });
 
-  // ---- Spawn camera: tilted SimCity-screenshot angle ----
+    // Striped roof so it reads as a checkpoint, not just a blue box.
+    const roofGeom = new THREE.BoxGeometry(NSG_BODY_W * 1.05, 0.18, NSG_BODY_D * 1.05);
+    const roofMat = new THREE.MeshLambertMaterial({ color: 0xf2eadb });
+    const roof = new THREE.Mesh(roofGeom, roofMat);
+    roof.position.set(nsg.pos[0], towerBaseY + NSG_BODY_H + 0.09, nsg.pos[1]);
+    roof.rotation.y = body.rotation.y;
+    scene.add(roof);
+    disposables.push(roofGeom, roofMat);
+
+    // Barrier arm sweeping across the road in the facing direction.
+    const armGeom = new THREE.BoxGeometry(BARRIER_LEN, BARRIER_THICK, BARRIER_THICK);
+    const armMat = new THREE.MeshLambertMaterial({ color: 0xe85a3a });
+    const arm = new THREE.Mesh(armGeom, armMat);
+    // Place barrier perpendicular to the building's facing — i.e. across the road.
+    // The 'facing' field on PlacedNsg already encodes the perpendicular direction.
+    arm.position.set(
+      nsg.pos[0] + nsg.facing[0] * (NSG_BODY_W * 0.65),
+      towerBaseY + NSG_BODY_H * 0.55,
+      nsg.pos[1] + nsg.facing[1] * (NSG_BODY_W * 0.65),
+    );
+    arm.rotation.y = -Math.atan2(nsg.facing[1], nsg.facing[0]);
+    scene.add(arm);
+    disposables.push(armGeom, armMat);
+  }
+
+  // ---- Public IPs (flagpoles) ----
+  for (const pip of world.publicIps) {
+    const poleGeom = new THREE.CylinderGeometry(FLAGPOLE_RADIUS, FLAGPOLE_RADIUS, FLAGPOLE_HEIGHT, 8);
+    const poleMat = new THREE.MeshLambertMaterial({ color: 0xf3ede0 });
+    const pole = new THREE.Mesh(poleGeom, poleMat);
+    pole.position.set(pip.pos[0], towerBaseY + FLAGPOLE_HEIGHT / 2, pip.pos[1]);
+    scene.add(pole);
+    disposables.push(poleGeom, poleMat);
+    serviceTargets.push(pole);
+    serviceLookup.set(pole, { kind: 'publicIp', data: pip });
+
+    // Flag at the top, coloured by SKU.
+    const flagColor = pip.sku.toLowerCase().startsWith('standard') ? FLAG_COLOR_STANDARD : FLAG_COLOR_BASIC;
+    const flagGeom = new THREE.PlaneGeometry(FLAG_W, FLAG_H);
+    const flagMat = new THREE.MeshLambertMaterial({ color: flagColor, side: THREE.DoubleSide });
+    const flag = new THREE.Mesh(flagGeom, flagMat);
+    flag.position.set(
+      pip.pos[0] + FLAG_W / 2,
+      towerBaseY + FLAGPOLE_HEIGHT - FLAG_H / 2,
+      pip.pos[1],
+    );
+    scene.add(flag);
+    disposables.push(flagGeom, flagMat);
+  }
+
+  // ---- Storage car parks ----
+  for (const sa of world.storage) {
+    const tint = CARPARK_TIER_TINT[sa.tier] ?? CARPARK_BODY_COLOR;
+    const totalH = sa.storeys * 0.95;
+    const bodyGeom = new THREE.BoxGeometry(CARPARK_W, totalH, CARPARK_D);
+    const bodyMat = new THREE.MeshLambertMaterial({ color: tint });
+    const body = new THREE.Mesh(bodyGeom, bodyMat);
+    body.position.set(sa.pos[0], totalH / 2, sa.pos[1]);
+    scene.add(body);
+    disposables.push(bodyGeom, bodyMat);
+    serviceTargets.push(body);
+    serviceLookup.set(body, { kind: 'storage', data: sa });
+
+    // Floor bands so it reads as multistorey parking, not a solid block.
+    const slabGeom = new THREE.BoxGeometry(CARPARK_W * 1.04, 0.08, CARPARK_D * 1.04);
+    const slabMat = new THREE.MeshLambertMaterial({ color: CARPARK_FLOOR_COLOR });
+    disposables.push(slabGeom, slabMat);
+    for (let s = 1; s < sa.storeys; s++) {
+      const slab = new THREE.Mesh(slabGeom, slabMat);
+      slab.position.set(sa.pos[0], (totalH / sa.storeys) * s, sa.pos[1]);
+      scene.add(slab);
+    }
+
+    addLabelSprite(scene, sa.name, sa.pos[0], totalH + 1.2, sa.pos[1], 0.42, 0xffffff, disposables, 10);
+  }
+
+  // ---- Spawn camera: high oblique "city map" view ----
   const cxc = (world.bounds.min[0] + world.bounds.max[0]) / 2;
   const czc = (world.bounds.min[1] + world.bounds.max[1]) / 2;
-  const tallestHill = Math.max(0, ...world.vnets.map(v => vnetHeight(v.id)));
-  const spawnY = Math.max(16, tallestHill * 1.4, span * 0.22);
-  const spawnPos = new THREE.Vector3(cxc - span * 0.4, spawnY, czc + span * 0.5);
-  const spawnLook = new THREE.Vector3(cxc, tallestHill * 0.5, czc);
+  const spawnY = Math.max(35, span * 0.45);
+  const spawnPos = new THREE.Vector3(cxc - span * 0.35, spawnY, czc + span * 0.85);
+  const spawnLook = new THREE.Vector3(cxc, 2, czc);
 
   return {
     scene,
     vmTowers,
     vmIndex: world.vms,
     vmInstanceMap,
+    serviceTargets,
+    serviceLookup,
     spawn: { pos: spawnPos, lookAt: spawnLook },
     dispose() {
       for (const d of disposables) d.dispose();
@@ -273,15 +462,77 @@ export function buildScene(world: World): BuiltScene {
   };
 }
 
-// A peering bridge is a long thin 3D box spanning two hilltops. Sits at the
-// max of the two hilltop heights so it never clips into either hill.
+// ---- Wall geometry: cut gates into each face ----------------------------
+type Face = 'north' | 'south' | 'east' | 'west';
+interface DistrictGeom { cx: number; cz: number; halfW: number; halfD: number; color: number; }
+interface Gate { face: Face; offset: number; }
+
+function pickGate(here: DistrictGeom, other: DistrictGeom): Gate {
+  const dx = other.cx - here.cx;
+  const dz = other.cz - here.cz;
+  if (Math.abs(dx) >= Math.abs(dz)) {
+    // East/west face. Offset along Z, clamped to face.
+    return { face: dx > 0 ? 'east' : 'west', offset: clampOffset(dz, here.halfD) };
+  }
+  return { face: dz > 0 ? 'south' : 'north', offset: clampOffset(dx, here.halfW) };
+}
+
+function clampOffset(v: number, halfExtent: number): number {
+  const inset = GATE_WIDTH / 2 + 1;
+  return Math.max(-(halfExtent - inset), Math.min(halfExtent - inset, v));
+}
+
+function addWallSegments(
+  scene: THREE.Scene, face: Face, d: DistrictGeom, gates: Gate[],
+  mat: THREE.Material, disposables: Array<{ dispose(): void }>,
+) {
+  const wallY = DISTRICT_FLOOR_HEIGHT + WALL_HEIGHT / 2;
+  const faceGates = gates.filter(g => g.face === face).map(g => g.offset).sort((a, b) => a - b);
+
+  // For north/south face the wall runs along X (length = halfW*2). Z is fixed.
+  // For east/west face the wall runs along Z (length = halfD*2). X is fixed.
+  const along = (face === 'north' || face === 'south') ? d.halfW : d.halfD;
+  const fixedAxis = (face === 'north') ? d.cz - d.halfD
+                  : (face === 'south') ? d.cz + d.halfD
+                  : (face === 'east')  ? d.cx + d.halfW
+                                       : d.cx - d.halfW;
+
+  // Build a list of [start, end] segments along the face minus gate openings.
+  const cuts: Array<[number, number]> = [];
+  let cursor = -along;
+  for (const g of faceGates) {
+    const gateStart = g - GATE_WIDTH / 2;
+    const gateEnd = g + GATE_WIDTH / 2;
+    if (gateStart > cursor) cuts.push([cursor, gateStart]);
+    cursor = Math.max(cursor, gateEnd);
+  }
+  if (cursor < along) cuts.push([cursor, along]);
+
+  for (const [s, e] of cuts) {
+    const len = e - s;
+    if (len <= 0.1) continue;
+    let geom: THREE.BoxGeometry, x: number, z: number;
+    if (face === 'north' || face === 'south') {
+      geom = new THREE.BoxGeometry(len, WALL_HEIGHT, WALL_THICKNESS);
+      x = d.cx + (s + e) / 2;
+      z = fixedAxis;
+    } else {
+      geom = new THREE.BoxGeometry(WALL_THICKNESS, WALL_HEIGHT, len);
+      x = fixedAxis;
+      z = d.cz + (s + e) / 2;
+    }
+    const wall = new THREE.Mesh(geom, mat);
+    wall.position.set(x, wallY, z);
+    scene.add(wall);
+    disposables.push(geom);
+  }
+}
+
+// ---- Bridge: a long 3D box spanning two districts at ground level. -----
 function addBridgeBox(
   scene: THREE.Scene,
-  a: { yTop: number; cx: number; cz: number },
-  b: { yTop: number; cx: number; cz: number },
-  width: number,
-  height: number,
-  color: number,
+  a: DistrictGeom, b: DistrictGeom,
+  width: number, height: number, color: number,
   disposables: Array<{ dispose(): void }>,
 ) {
   const dx = b.cx - a.cx;
@@ -290,33 +541,22 @@ function addBridgeBox(
   if (len < 0.5) return;
   const cx = (a.cx + b.cx) / 2;
   const cz = (a.cz + b.cz) / 2;
-  // Y of the deck is just above the higher hilltop so the bridge sits proudly.
-  const y = Math.max(a.yTop, b.yTop) + height / 2 + 0.2;
+  // Bridge deck just above the district floors.
+  const y = DISTRICT_FLOOR_HEIGHT + height / 2 + 0.05;
   const geom = new THREE.BoxGeometry(len, height, width);
   const mat = new THREE.MeshLambertMaterial({ color });
   const mesh = new THREE.Mesh(geom, mat);
   mesh.position.set(cx, y, cz);
-  // Rotate around Y so the long axis points from A to B.
   mesh.rotation.y = -Math.atan2(dz, dx);
   scene.add(mesh);
   disposables.push(geom, mat);
-  // Two short pylons at each end to suggest support, just for SimCity charm.
-  for (const end of [a, b]) {
-    const pylonH = Math.max(0.5, y - 0.1);
-    const pg = new THREE.BoxGeometry(width * 0.45, pylonH, width * 0.45);
-    const pm = new THREE.MeshLambertMaterial({ color: 0x8c8b86 });
-    const p = new THREE.Mesh(pg, pm);
-    p.position.set(end.cx, pylonH / 2, end.cz);
-    scene.add(p);
-    disposables.push(pg, pm);
-  }
 }
 
-// Build one merged mesh from quads laid along each road segment.
+// ---- Roads: merged mesh of horizontal quads. ---------------------------
 function buildRoadMesh(
   scene: THREE.Scene,
-  segments: Array<{ ax: number; az: number; bx: number; bz: number; halfWidth: number; y: number; }>,
-  color: number,
+  segments: Array<{ ax: number; az: number; bx: number; bz: number; halfWidth: number; }>,
+  y: number, color: number,
   disposables: Array<{ dispose(): void }>,
 ) {
   if (segments.length === 0) return;
@@ -336,7 +576,7 @@ function buildRoadMesh(
     const ax2 = s.ax - nx * w, az2 = s.az - nz * w;
     const bx1 = s.bx + nx * w, bz1 = s.bz + nz * w;
     const bx2 = s.bx - nx * w, bz2 = s.bz - nz * w;
-    positions.push(ax1, s.y, az1, ax2, s.y, az2, bx2, s.y, bz2, bx1, s.y, bz1);
+    positions.push(ax1, y, az1, ax2, y, az2, bx2, y, bz2, bx1, y, bz1);
     for (let i = 0; i < 4; i++) normals.push(0, 1, 0);
     indices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
     baseIdx += 4;
@@ -351,14 +591,24 @@ function buildRoadMesh(
   scene.add(new THREE.Mesh(geom, mat));
 }
 
+// ---- Helpers ------------------------------------------------------------
+function clamp01(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  return n < 0 ? 0 : n > 1 ? 1 : n;
+}
+
+function darkenColor(hex: number, amt: number): number {
+  const r = (hex >> 16) & 0xff;
+  const g = (hex >> 8) & 0xff;
+  const b = hex & 0xff;
+  return (Math.round(r * (1 - amt)) << 16) | (Math.round(g * (1 - amt)) << 8) | Math.round(b * (1 - amt));
+}
+
 function addLabelSprite(
   scene: THREE.Scene,
   text: string,
-  x: number,
-  y: number,
-  z: number,
-  scale: number,
-  color: number,
+  x: number, y: number, z: number,
+  scale: number, color: number,
   disposables: Array<{ dispose(): void }>,
   worldWidth: number,
 ) {
