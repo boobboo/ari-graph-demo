@@ -105,7 +105,15 @@ export type ServiceTip =
 export function buildScene(world: World): BuiltScene {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0xc7e1f0);
-  scene.fog = new THREE.Fog(0xc7e1f0, 220, 1200);
+  // Fog scales with the world so a large inventory doesn't sit beyond fog.
+  // We bias the near edge inward so close detail stays crisp.
+  const worldSpan = Math.max(
+    world.bounds.max[0] - world.bounds.min[0],
+    world.bounds.max[1] - world.bounds.min[1],
+  );
+  const fogNear = Math.max(120, worldSpan * 0.5);
+  const fogFar = Math.max(600, worldSpan * 2.0);
+  scene.fog = new THREE.Fog(0xc7e1f0, fogNear, fogFar);
 
   // ---- Lights ----
   scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.7));
@@ -438,10 +446,21 @@ export function buildScene(world: World): BuiltScene {
   }
 
   // ---- Spawn camera: high oblique "city map" view ----
+  // Frame the VNet bounding box, not the storage strip — strip is wider but
+  // the city is what the user wants to see first. Camera distance scales
+  // with that core extent.
   const cxc = (world.bounds.min[0] + world.bounds.max[0]) / 2;
   const czc = (world.bounds.min[1] + world.bounds.max[1]) / 2;
-  const spawnY = Math.max(35, span * 0.45);
-  const spawnPos = new THREE.Vector3(cxc - span * 0.35, spawnY, czc + span * 0.85);
+  const coreSpan = world.vnets.length > 0
+    ? Math.max(
+        Math.max(...world.vnets.map(v => v.center[0] + v.size / 2)) -
+        Math.min(...world.vnets.map(v => v.center[0] - v.size / 2)),
+        Math.max(...world.vnets.map(v => v.center[1] + v.size / 2)) -
+        Math.min(...world.vnets.map(v => v.center[1] - v.size / 2)),
+      )
+    : span;
+  const spawnY = Math.max(35, coreSpan * 0.65);
+  const spawnPos = new THREE.Vector3(cxc - coreSpan * 0.6, spawnY, czc + coreSpan * 1.0);
   const spawnLook = new THREE.Vector3(cxc, 2, czc);
 
   return {

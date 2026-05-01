@@ -142,11 +142,12 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
     const cidr = pick(r, ['Address Range', 'Subnet Address', 'CIDR', 'Subnet Range', 'Address Prefix']);
     addSubnet(vn, sn, cidr);
   }
-  // ARI sometimes one-row-per-subnet inside the VNet sheet:
+  // ARI almost always lays out one-row-per-subnet inside the VNet sheet
+  // (Microsoft ARI uses 'Subnet Name' + 'Subnet Prefix').
   for (const r of vnetRows) {
     const vn = pick(r, ['Name', 'VNet Name', 'Virtual Network Name']);
     const sn = pick(r, ['Subnet', 'Subnet Name']);
-    const cidr = pick(r, ['Subnet Address', 'Subnet Range', 'Subnet CIDR']);
+    const cidr = pick(r, ['Subnet Prefix', 'Subnet Address', 'Subnet Range', 'Subnet CIDR']);
     if (sn) addSubnet(vn, sn, cidr);
   }
 
@@ -157,7 +158,10 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   const vmIdByNicName = new Map<string, string>();
   for (const r of nicRows) {
     const nicName = pick(r, ['Name', 'NIC Name', 'Network Interface']);
-    const vmName = pick(r, ['Virtual Machine', 'VM Name', 'VM', 'Owner', 'Attached To']);
+    // Real ARI exports use 'Attached Resource' (with 'Attached Resource Type'
+    // saying which kind). We accept it as a VM name alongside the older names
+    // — non-VM attachments will simply not resolve to a VM later.
+    const vmName = pick(r, ['Virtual Machine', 'VM Name', 'VM', 'Owner', 'Attached To', 'Attached Resource']);
     const subnetName = pick(r, ['Subnet', 'Subnet Name']);
     const vnetName = pick(r, ['Virtual Network', 'VNET', 'VNet', 'Network']);
     const ip = pick(r, ['Private IP', 'Private IP Address', 'IP', 'Primary IP']);
@@ -226,22 +230,34 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   }
 
   // ---- Peerings ----
+  // Real ARI uses 'VNET Name' and 'Peering VNet' columns.
   const peerings: Peering[] = [];
   for (const r of peerRows) {
-    const a = pick(r, ['VNet 1', 'Source VNet', 'From VNet', 'Local VNet', 'Virtual Network', 'VNET']);
-    const b = pick(r, ['VNet 2', 'Target VNet', 'To VNet', 'Remote VNet', 'Peer VNet', 'Remote Virtual Network']);
+    const a = pick(r, ['VNet 1', 'Source VNet', 'From VNet', 'Local VNet', 'VNET Name', 'Virtual Network', 'VNET']);
+    const b = pick(r, ['VNet 2', 'Target VNet', 'To VNet', 'Remote VNet', 'Peering VNet', 'Peer VNet', 'Remote Virtual Network']);
     if (!a || !b) continue;
     peerings.push({ a: norm(a), b: norm(b), state: pick(r, ['State', 'Peering State', 'Status']) });
   }
 
   // ---- NSGs ----
+  // Real ARI exports compress the association into a "Related VNETs and Subnets"
+  // string like "vnet-foo (snet-bar)" — sometimes with multiple entries comma
+  // or newline-separated. We accept either the structured columns or that
+  // free-text column. If multiple subnets share an NSG, the first one wins
+  // for placement; the rest are reachable later if we add multi-attach.
   const nsgs: Nsg[] = [];
   for (const r of nsgRows) {
     const name = pick(r, ['Name', 'NSG Name', 'Network Security Group']);
     if (!name) continue;
-    const subnetName = pick(r, ['Subnet', 'Subnet Name', 'Associated Subnet']);
-    const vnetName = pick(r, ['Virtual Network', 'VNET', 'VNet', 'Associated VNet']);
+    let subnetName = pick(r, ['Subnet', 'Subnet Name', 'Associated Subnet']);
+    let vnetName = pick(r, ['Virtual Network', 'VNET', 'VNet', 'Associated VNet']);
     const nicName = pick(r, ['Network Interface', 'NIC', 'NIC Name', 'Associated NIC']);
+    if (!subnetName && !nicName) {
+      const related = pick(r, ['Related VNETs and Subnets', 'Related', 'Related Subnets']);
+      // Format: "vnet-name (subnet-name)" — possibly multiple, comma/newline-separated.
+      const m = related.match(/([^\s,()]+)\s*\(([^)]+)\)/);
+      if (m) { vnetName = m[1].trim(); subnetName = m[2].trim(); }
+    }
     nsgs.push({
       id: norm(name),
       name,
@@ -255,11 +271,22 @@ export function parseAri(buf: ArrayBuffer, log: (msg: string) => void): Graph {
   }
 
   // ---- Public IPs ----
+  // Real ARI uses 'Associated Resource' + 'Associated Resource Type'. We treat
+  // 'Associated Resource' as a NIC name only if the type clearly says so,
+  // otherwise the PIP is unattached (App Gateway / LB / Bastion attachments
+  // are handled in Phase C).
   const publicIps: PublicIp[] = [];
   for (const r of pipRows) {
     const name = pick(r, ['Name', 'Public IP Name', 'PublicIP Name']);
     if (!name) continue;
-    const nicName = pick(r, ['Network Interface', 'NIC', 'NIC Name', 'Associated NIC', 'Attached To']);
+    let nicName = pick(r, ['Network Interface', 'NIC', 'NIC Name', 'Associated NIC', 'Attached To']);
+    if (!nicName) {
+      const assocType = pick(r, ['Associated Resource Type', 'Resource Type']).toLowerCase();
+      const assoc = pick(r, ['Associated Resource', 'Attached Resource']);
+      if (assoc && (assocType.includes('networkinterface') || assocType.includes('nic'))) {
+        nicName = assoc;
+      }
+    }
     publicIps.push({
       id: norm(name),
       name,

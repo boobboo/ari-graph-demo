@@ -57,7 +57,9 @@ async function loadFile(buf: ArrayBuffer, name: string) {
   renderer.setSize(window.innerWidth, window.innerHeight);
   root.appendChild(renderer.domElement);
 
-  const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 2000);
+  // Camera far plane bumped so very large inventories (hundreds of resources,
+  // multi-thousand-unit world spans) don't clip at the back.
+  const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 6000);
   const built = buildScene(world);
   camera.position.copy(built.spawn.pos);
   camera.lookAt(built.spawn.lookAt);

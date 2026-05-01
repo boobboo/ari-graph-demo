@@ -7,9 +7,10 @@ const VM_SPACING = 4;          // grid pitch between tower plots within a subnet
 const VM_PAD = 3;              // padding around the tower grid on a subnet plot
 const SUBNET_GAP = 8;          // gap between subnet plots (room for streets)
 const VNET_GAP = 36;           // gap between districts (room for inter-district roads)
-const STORAGE_PITCH = 7;       // gap between storage car parks in the services strip
-const STORAGE_RG_GAP = 4;      // extra gap between RG groups in the strip
-const STORAGE_OFFSET = 22;     // distance of services strip from the world bounds edge
+const STORAGE_PITCH = 7;       // X-pitch between storage car parks
+const STORAGE_ROW_PITCH = 8;   // Z-pitch between rows in the strip
+const STORAGE_RG_GAP = 4;      // extra X-gap between RG groups (only when not wrapping)
+const STORAGE_OFFSET = 22;     // distance of services strip below the VNet bounds
 const MAX_TOWER = 32;          // tallest VM tower, in blocks
 const MIN_TOWER = 1;
 
@@ -248,32 +249,37 @@ export function buildWorld(graph: Graph): World {
   }
 
   // ---- Storage accounts: services strip along the south edge of the world ----
-  // Storage isn't network-attached, so it sits off the districts in a single
-  // row, grouped by RG with a small gap between groups.
+  // Storage isn't network-attached, so it sits off the districts in its own
+  // grid: rows-by-cols grouped by RG. The grid wraps so a long inventory
+  // (hundreds of accounts) doesn't sprawl into a single 1km-long row.
   const placedStorage: PlacedStorage[] = [];
   if (graph.storage.length > 0) {
     // Sort by RG, then name, so RG groups stay together.
     const sorted = [...graph.storage].sort((a, b) =>
       a.rg === b.rg ? a.name.localeCompare(b.name) : a.rg.localeCompare(b.rg));
-    // Compute total strip width to centre under the world bounds.
-    const widths: number[] = [];
-    let prevRg: string | null = null;
-    for (const s of sorted) {
-      widths.push(STORAGE_PITCH + (prevRg !== null && prevRg !== s.rg ? STORAGE_RG_GAP : 0));
-      prevRg = s.rg;
-    }
-    const totalWidth = widths.reduce((a, b) => a + b, 0);
+
+    // Aim for a roughly square grid: cols ≈ sqrt(n) * 1.4. Hard-cap so even
+    // tiny inventories don't end up as a single strip.
+    const cols = Math.max(6, Math.ceil(Math.sqrt(sorted.length) * 1.4));
+
     const stripCx = placedVnets.length
       ? placedVnets.reduce((sum, v) => sum + v.center[0], 0) / placedVnets.length
       : 0;
-    const stripStartX = stripCx - totalWidth / 2 + STORAGE_PITCH / 2;
-    const stripZ = (placedVnets.length
+    const gridWidth = cols * STORAGE_PITCH;
+    const stripStartX = stripCx - gridWidth / 2 + STORAGE_PITCH / 2;
+    const stripStartZ = (placedVnets.length
       ? Math.max(...placedVnets.map(v => v.center[1] + v.size / 2))
       : 0) + STORAGE_OFFSET;
-    let cursorX = stripStartX;
-    prevRg = null;
+
+    let col = 0, row = 0;
+    let prevRg: string | null = null;
     for (const s of sorted) {
-      if (prevRg !== null && prevRg !== s.rg) cursorX += STORAGE_RG_GAP;
+      // RG break: bump to a new row if we've already used most of this row,
+      // otherwise just leave a small in-row gap.
+      const rgChanged = prevRg !== null && prevRg !== s.rg;
+      if (rgChanged && col > cols - 3) { col = 0; row++; }
+      const x = stripStartX + col * STORAGE_PITCH + (rgChanged && col > 0 ? STORAGE_RG_GAP : 0);
+      const z = stripStartZ + row * STORAGE_ROW_PITCH;
       // Storeys: bigger SKU/kind → taller car park.
       const skuLow = s.sku.toLowerCase();
       const kindLow = s.kind.toLowerCase();
@@ -282,8 +288,9 @@ export function buildWorld(graph: Graph): World {
       if (skuLow.includes('zrs') || skuLow.includes('grs')) storeys += 1;
       if (kindLow.includes('blob')) storeys += 1;
       if (s.tier === 'archive') storeys = Math.max(2, storeys - 1);
-      placedStorage.push({ ...s, pos: [cursorX, stripZ], storeys });
-      cursorX += STORAGE_PITCH;
+      placedStorage.push({ ...s, pos: [x, z], storeys });
+      col++;
+      if (col >= cols) { col = 0; row++; }
       prevRg = s.rg;
     }
   }
